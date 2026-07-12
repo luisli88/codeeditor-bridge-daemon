@@ -9,8 +9,8 @@ import (
 )
 
 type fakeStore struct {
-	entitlement   Entitlement
-	activeCount   int
+	entitlement    Entitlement
+	activeCount    int
 	entitlementErr error
 	countErr       error
 }

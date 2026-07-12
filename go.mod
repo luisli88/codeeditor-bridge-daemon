@@ -7,6 +7,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.51
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.60.0
 	github.com/coder/websocket v1.8.15
+	github.com/creack/pty v1.1.24
+	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
 )
 
