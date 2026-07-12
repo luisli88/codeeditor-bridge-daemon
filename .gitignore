@@ -1,0 +1,19 @@
+# Binaries (compiled output only — not the cmd/bridged/ source directory)
+/bridged
+*.exe
+*.test
+*.out
+
+# Go build cache / vendor (not vendored — go.sum is the source of truth)
+vendor/
+
+# Local dev TLS certs (contracts/mosh-terminal.md, quickstart.md)
+*.crt
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+.env*
