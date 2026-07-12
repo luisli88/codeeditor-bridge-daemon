@@ -74,7 +74,7 @@ func (c *Cloner) Clone(
 	dest := c.WorkspacePath(workspaceID)
 
 	cmd := exec.CommandContext(ctx, "git", "clone", "--progress", repositoryURL, dest)
-	env, cleanup, err := c.credentialEnv(credential)
+	env, cleanup, err := credentialEnv(credential)
 	if err != nil {
 		return fmt.Errorf("gitmanager: prepare clone credential: %w", err)
 	}
@@ -153,7 +153,10 @@ func scanLinesOrCarriageReturns(data []byte, atEOF bool) (advance int, token []b
 // credentialEnv prepares the environment variables git needs to
 // authenticate non-interactively, and a cleanup func that removes any
 // temp file it wrote. Safe to call with credential == nil (public repo).
-func (c *Cloner) credentialEnv(credential *CloneCredential) ([]string, func(), error) {
+// Shared by Clone and Operations.Push/Pull (operations.go) — the same
+// credential injection applies to every git subprocess that might touch
+// the network.
+func credentialEnv(credential *CloneCredential) ([]string, func(), error) {
 	noop := func() {}
 	if credential == nil {
 		return nil, noop, nil
