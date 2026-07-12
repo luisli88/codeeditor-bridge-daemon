@@ -43,14 +43,14 @@ const (
 // credential — the real secret lives only in SecretStore, referenced by
 // SecretRef (FR-021).
 type Credential struct {
-	ID          string
-	OwnerUserID string
-	Alias       string
-	Domain      string
-	Kind        CredentialKind
-	Status      CredentialStatus
-	LastUsedAt  *time.Time
-	SecretRef   string
+	ID          string           `json:"id"`
+	OwnerUserID string           `json:"ownerUserId"`
+	Alias       string           `json:"alias"`
+	Domain      string           `json:"domain"`
+	Kind        CredentialKind   `json:"kind"`
+	Status      CredentialStatus `json:"status"`
+	LastUsedAt  *time.Time       `json:"lastUsedAt,omitempty"`
+	SecretRef   string           `json:"secretRef"`
 }
 
 // SecretStore is the persistence seam for the actual secret material —

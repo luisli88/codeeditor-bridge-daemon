@@ -1,0 +1,155 @@
+package tests
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/bootstrap"
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/devpod"
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/entitlements"
+)
+
+type allowAllStore struct{}
+
+func (allowAllStore) GetEntitlement(ctx context.Context, userID string) (entitlements.Entitlement, error) {
+	return entitlements.Entitlement{OwnerUserID: userID, HasActiveSubscription: true, ConcurrentEnvironmentLimit: 5}, nil
+}
+
+func (allowAllStore) CountActiveProjects(ctx context.Context, userID string) (int, error) {
+	return 0, nil
+}
+
+type denyStore struct{}
+
+func (denyStore) GetEntitlement(ctx context.Context, userID string) (entitlements.Entitlement, error) {
+	return entitlements.Entitlement{OwnerUserID: userID, HasActiveSubscription: false}, nil
+}
+
+func (denyStore) CountActiveProjects(ctx context.Context, userID string) (int, error) {
+	return 0, nil
+}
+
+type provisionerFakes struct {
+	cloneCalls         int
+	cloneShouldFail    bool
+	devcontainerCalls  int
+	devPodUpCalls      int
+	devPodUpShouldFail bool
+}
+
+func newProvisioner(gate *entitlements.Gate, fakes *provisionerFakes) *devpod.Provisioner {
+	return devpod.NewProvisioner(
+		gate,
+		func(workspaceID string) string { return "/efs/" + workspaceID },
+		func(ctx context.Context, workspaceID, repositoryURL string, credential *devpod.CloneCredential) error {
+			fakes.cloneCalls++
+			if fakes.cloneShouldFail {
+				return errors.New("clone failed")
+			}
+			return nil
+		},
+		func(ctx context.Context, secretRef string) (string, error) {
+			return "resolved-secret", nil
+		},
+		func(workspacePath string) (map[string]any, error) {
+			fakes.devcontainerCalls++
+			return map[string]any{"image": "mcr.microsoft.com/devcontainers/go:latest"}, nil
+		},
+		func(workspacePath string) []string { return []string{"go"} },
+		func(ctx context.Context, workspacePath string) error {
+			fakes.devPodUpCalls++
+			if fakes.devPodUpShouldFail {
+				return errors.New("devpod up failed")
+			}
+			return nil
+		},
+		func(ctx context.Context, languages []string) []bootstrap.LanguageServer {
+			servers := make([]bootstrap.LanguageServer, len(languages))
+			for i, lang := range languages {
+				servers[i] = bootstrap.LanguageServer{Language: lang, Status: bootstrap.LanguageServerStatusReady}
+			}
+			return servers
+		},
+		func(ctx context.Context) error { return nil },
+	)
+}
+
+func TestProvision_AllStepsSucceed_ReachesReady(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{}
+	p := newProvisioner(gate, fakes)
+
+	result := p.Provision(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	})
+
+	assert.Equal(t, devpod.StatusReady, result.Status)
+	assert.Equal(t, 1, fakes.cloneCalls)
+	for _, step := range result.Steps {
+		assert.Equal(t, devpod.StepDone, step.Status, "step %s should be done", step.Name)
+	}
+}
+
+// FR-024
+func TestProvision_QuotaExceeded_StopsBeforeCloning(t *testing.T) {
+	gate := entitlements.NewGate(denyStore{})
+	fakes := &provisionerFakes{}
+	p := newProvisioner(gate, fakes)
+
+	result := p.Provision(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	})
+
+	assert.Equal(t, devpod.StatusError, result.Status)
+	assert.Equal(t, 0, fakes.cloneCalls, "must not clone when the gate denies provisioning")
+	require.NotNil(t, result.Reason)
+	assert.Equal(t, entitlements.ReasonNoActivePlan, *result.Reason)
+}
+
+// FR-023: a clone failure with no credential at all reads as "this repo
+// needs one", not a generic error.
+func TestProvision_CloneFailsWithNoCredential_ReportsPendingCredential(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{cloneShouldFail: true}
+	p := newProvisioner(gate, fakes)
+
+	result := p.Provision(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	})
+
+	assert.Equal(t, devpod.StatusPendingCredential, result.Status)
+}
+
+// FR-028: retry only the failed step, without re-cloning.
+func TestRetryStep_AfterDevPodUpFailure_RetriesOnlyThatStepWithoutRecloning(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{devPodUpShouldFail: true}
+	p := newProvisioner(gate, fakes)
+
+	result := p.Provision(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	})
+	require.Equal(t, devpod.StatusError, result.Status)
+	assert.Equal(t, 1, fakes.cloneCalls)
+	assert.Equal(t, 1, fakes.devPodUpCalls)
+
+	fakes.devPodUpShouldFail = false
+	p.RetryStep(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	}, result, devpod.StepDevPodUp)
+
+	assert.Equal(t, 1, fakes.cloneCalls, "retrying devpod-up must not re-clone")
+	assert.Equal(t, 2, fakes.devPodUpCalls)
+
+	var devPodStepStatus devpod.StepStatus
+	for _, step := range result.Steps {
+		if step.Name == devpod.StepDevPodUp {
+			devPodStepStatus = step.Status
+		}
+	}
+	assert.Equal(t, devpod.StepDone, devPodStepStatus)
+}
