@@ -1,54 +1,54 @@
 # codeeditor-bridge-daemon
 
-Control plane de larga duración de CodeEditor, escrito en **Go**. Multiplexa un único WebSocket seguro hacia el cliente en los canales `lsp`, `shell`, `claude`, `fs`, `run`, `git`, `debug` y `entitlements`, y sostiene vivas entre reconexiones las sesiones `tmux` de cada proyecto (incluida la sesión interactiva del CLI `claude` dentro de esa misma `tmux` — sin Claude Agent SDK, ver research.md §7) y los procesos de Language Server.
+CodeEditor's long-lived control plane, written in **Go**. Multiplexes a single secure WebSocket to the client across the `lsp`, `shell`, `claude`, `fs`, `run`, `git`, `debug`, and `entitlements` channels, and keeps each project's `tmux` session alive across reconnects (including the interactive `claude` CLI session inside that same `tmux` — no Claude Agent SDK, see research.md §7) along with its Language Server processes.
 
-Este repositorio es un **submódulo** del repositorio coordinador [`CodeEditor`](https://github.com/luisli88/CodeEditor), que contiene las specs, la arquitectura y la constitución de las que este componente depende. Léelo primero si vas a tocar este código — en particular el Principio VII (por qué este componente es una excepción explícita al patrón "Lambda por dominio" del resto del backend) y el Principio II (Terraform vetado; toda infraestructura vía CDK/CloudFormation).
+This repository is a **submodule** of the coordinator repository [`CodeEditor`](https://github.com/luisli88/CodeEditor), which holds the specs, architecture, and constitution this component depends on. Read it first before touching this code — in particular Principio VII (why this component is an explicit exception to the rest of the backend's "one Lambda per domain" pattern) and Principio II (Terraform banned; all infrastructure via CDK/CloudFormation).
 
-## Prerrequisitos
+## Prerequisites
 
-- Go 1.22+
-- [DevPod CLI](https://devpod.sh/) (`devpod` en `$PATH`)
-- Docker (o el motor de contenedores usado como target de DevPod)
+- Go 1.26+
+- [DevPod CLI](https://devpod.sh/) (`devpod` on `$PATH`)
+- Docker (or whatever container engine DevPod is configured to target)
 - `tmux`
 
-## Estructura
+## Structure
 
 ```text
-cmd/bridged/          # entrypoint del binario
+cmd/bridged/          # binary entrypoint — wires every real channel/HTTP handler together
 internal/
-├── ws/                # servidor WebSocket multiplexado
-├── gitmanager/        # clonado a EFS antes de crear el contenedor del proyecto
-├── entitlements/      # cliente al Entitlements Gate (codeeditor-backend)
-├── devpod/            # invocación de devpod CLI + devcontainer.json
-├── bootstrap/         # instalación automática de Language Servers y toolchains de depuración
-├── debug/             # adaptadores DAP por lenguaje (debugpy, vscode-js-debug, dlv dap, java-debug, lldb-dap, CodeLLDB)
-└── session/           # tmux (Terminal), una sesión persistente por proyecto; detecta el estado de auth del CLI `claude` para el canal `claude` — sin Claude Agent SDK (research.md §7)
+├── ws/                # multiplexed WebSocket server
+├── gitmanager/        # cloning to EFS before the project's container exists; SecretStore (AWS + local file-based)
+├── entitlements/      # Entitlements Gate client (codeeditor-backend)
+├── devpod/            # devpod CLI invocation + devcontainer.json
+├── bootstrap/         # automatic install of Language Servers and debug toolchains
+├── debug/             # per-language DAP adapters (debugpy, vscode-js-debug, dlv dap, java-debug, lldb-dap, CodeLLDB)
+└── session/           # tmux (Terminal), one persistent session per project; detects the `claude` CLI's auth state for the `claude` channel — no Claude Agent SDK (research.md §7)
 tests/
 ```
 
-Ver `specs/001-core-development-flows/contracts/websocket-protocol.md` del repositorio coordinador para el contrato completo del protocolo multiplexado.
+See `specs/001-core-development-flows/contracts/websocket-protocol.md` in the coordinator repo for the full multiplexed protocol contract.
 
-## Configuración
+## Configuration
 
-`cmd/bridged` se configura hoy solo por flags de línea de comandos (sin variables de entorno ni archivo de config):
+`cmd/bridged` is configured today only via command-line flags (no environment variables or config file):
 
-| Flag | Default | Descripción |
+| Flag | Default | Description |
 |---|---|---|
-| `--port` | `8443` | Puerto de escucha |
-| `--tls-cert` | *(requerido)* | Ruta al certificado TLS |
-| `--tls-key` | *(requerido)* | Ruta a la llave privada TLS |
-| `--workspace-dir` | `/var/lib/codeeditor/workspaces` | Raíz donde se clonan los Workspaces (equivalente local al mount de EFS) |
-| `--secrets-dir` | `/var/lib/codeeditor/secrets` | Raíz de `gitmanager.LocalFileStore` — credenciales de git self-hosted, sin AWS |
-| `--mosh-udp-port-range` | `60000-61000` | Rango de puertos UDP que valida el checklist de `/handshake` |
+| `--port` | `8443` | Listen port |
+| `--tls-cert` | *(required)* | Path to the TLS certificate |
+| `--tls-key` | *(required)* | Path to the TLS private key |
+| `--workspace-dir` | `/var/lib/codeeditor/workspaces` | Root Workspaces are cloned into (local equivalent of the EFS mount) |
+| `--secrets-dir` | `/var/lib/codeeditor/secrets` | Root for `gitmanager.LocalFileStore` — self-hosted git credentials, no AWS |
+| `--mosh-udp-port-range` | `60000-61000` | UDP port range the `/handshake` checklist validates |
 
-## Cómo correr localmente
+## Running locally
 
 ```bash
 go run ./cmd/bridged --port 8443 --tls-cert dev.crt --tls-key dev.key \
   --workspace-dir ./tmp/workspaces --secrets-dir ./tmp/secrets
 ```
 
-`main.go` registra todos los canales de `internal/ws` con implementación real: `lsp`, `shell`, `run`, `git`, `debug` — verificado sirviendo tráfico real de punta a punta (clonado real de un repo público, generación real de una llave SSH ed25519, detección real de `devcontainer.json`). `claude` no tiene handler propio — se empuja desde el `OutputWatcher` del canal `shell` (contracts/auth-flows.md), no hace falta uno. `entitlements` tampoco — el único llamador de `Gate.CheckQuota` es el `Provisioner`, alcanzado por `POST /projects/provision`, no un envelope WS directo (nada en la app lo manda tampoco: `EntitlementsService.swift` consulta `Amplify.API` directo). `fs` sigue sin ninguna implementación — nunca se construyó el sync del árbol de archivos, ver `specs/001-core-development-flows/tasks.md` T103.
+`main.go` registers every `internal/ws` channel that has a real implementation: `lsp`, `shell`, `run`, `git`, `debug` — verified serving real traffic end to end (a real clone of a public repo, real ed25519 SSH key generation, real `devcontainer.json` detection). `claude` has no handler of its own — it's pushed from the `shell` channel's `OutputWatcher` (contracts/auth-flows.md), no separate handler is needed. Neither does `entitlements` — the only caller of `Gate.CheckQuota` is the `Provisioner`, reached via `POST /projects/provision`, not a direct WS envelope (nothing in the app sends one either). `fs` still has no implementation anywhere — file-tree sync was never built, see `specs/001-core-development-flows/tasks.md` T103.
 
 ## Tests
 
@@ -57,18 +57,18 @@ go test ./... -cover
 golangci-lint run ./...
 ```
 
-Cobertura objetivo: ≥90% en `internal/entitlements`, `internal/gitmanager` e `internal/session` — ver Principio V de la constitución del repositorio coordinador.
+Target coverage: ≥90% on `internal/entitlements`, `internal/gitmanager`, and `internal/session` — see Principio V of the coordinator repo's constitution.
 
-## Despliegue
+## Deployment
 
-**Self-hosted (Mac mini, VPS, cuenta AWS propia)**: compilar el binario y correrlo como servicio persistente (systemd/launchd) en un host con `tmux`, Docker (o el motor de contenedores configurado como target de DevPod) y el DevPod CLI instalados.
+**Self-hosted (Mac mini, VPS, your own AWS account)**: build the binary and run it as a persistent service (systemd/launchd) on a host with `tmux`, Docker (or whatever engine DevPod is configured to target), and the DevPod CLI installed.
 
 ```bash
 go build -o bridged ./cmd/bridged
 ./bridged --port 8443 --tls-cert /etc/codeeditor/tls.crt --tls-key /etc/codeeditor/tls.key
 ```
 
-**Local con Docker** (para probar rápido sin systemd/launchd):
+**Local with Docker** (for fast iteration without systemd/launchd):
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
@@ -84,12 +84,12 @@ docker run --rm -p 8443:8443 \
   codeeditor-bridge-daemon
 ```
 
-Los dos volúmenes nombrados (`codeeditor-workspaces`, `codeeditor-secrets`) son opcionales pero recomendados — sin ellos, los Workspaces clonados y las credenciales de git generadas se pierden cada vez que el contenedor se recrea.
+The two named volumes (`codeeditor-workspaces`, `codeeditor-secrets`) are optional but recommended — without them, cloned Workspaces and generated git credentials are lost every time the container is recreated.
 
-El `Dockerfile` es la imagen del daemon en sí (Go binario + `tmux`/`git`/`ssh`/CLI de `devpod`/CLI de `docker`) — **no** es donde viven los Workspaces de cada proyecto. Esos los crea `devpod up` bajo demanda a partir del `devcontainer.json` de cada repositorio (detectado o generado, `internal/gitmanager`) — no hay ni debe haber una imagen fija de "workspace de CodeEditor" en ningún registry, es justamente lo que resuelve usar DevPod en vez de mantener imágenes propias por lenguaje. El socket de Docker del host se monta (no Docker-in-Docker) para que `devpod` cree esos Workspaces como contenedores hermanos, no hijos, del contenedor del daemon.
+The `Dockerfile` is the daemon's own image (Go binary + `tmux`/`git`/`ssh`/the `devpod` CLI/the `docker` CLI) — it is **not** where each project's Workspace lives. Those are created on demand by `devpod up` from each repository's own `devcontainer.json` (detected or generated, `internal/gitmanager`) — there is no, and shouldn't be, a fixed "CodeEditor workspace" image in any registry; that's exactly what using DevPod instead of maintaining per-language images solves. The host's Docker socket is mounted (not Docker-in-Docker) so `devpod` creates those Workspaces as sibling containers, not children, of the daemon's own container.
 
-**Verificado end-to-end en self-hosted** (fuera del contenedor, mismo binario): `/handshake` responde con el checklist real; `POST /git-credentials/ssh-key/generate` genera y almacena una llave ed25519 real; `POST /projects/provision` clona un repositorio público real, detecta/genera su `devcontainer.json`, y llega hasta el paso `devpod-up` — que solo falla porque `devpod` no estaba instalado en la máquina donde se corrió esta verificación puntual (si está instalado, como en la imagen de Docker, ese paso también corre real).
+**Verified end to end in self-hosted mode** (outside the container, same binary): `/handshake` responds with the machine's real checklist; `POST /git-credentials/ssh-key/generate` generates and stores a real ed25519 key; `POST /projects/provision` actually clones a real public repository, detects/generates its `devcontainer.json`, and reaches the `devpod-up` step — which only fails because `devpod` wasn't installed on the machine this particular check was run on (it is in the Docker image, so that step runs for real there too).
 
-**Gap real que sigue abierto**: `internal/ws/lsp_proxy.go`, `internal/debug` (adaptadores DAP), `internal/devpod` (ejecución de Run) e `internal/bootstrap.Executor` invocan sus subprocesos (`pyright-langserver`, `debugpy`, el comando de Run, `pip`/`npm`/etc.) directamente en el host/contenedor del propio Bridge Daemon — no dentro del contenedor del Workspace vía `devpod ssh`. Con un solo Workspace de prueba activo esto no se nota (todo corre en el mismo filesystem clonado), pero es incorrecto para múltiples Workspaces simultáneos, que es el caso real de producción. Cerrar esto es un cambio más grande (enrutar cada subproceso a través de `devpod ssh <workspace> -- <comando>`) que no estaba en el alcance de esta pasada.
+**Real gap still open**: `internal/ws/lsp_proxy.go`, `internal/debug` (DAP adapters), `internal/devpod` (Run execution), and `internal/bootstrap.Executor` all invoke their subprocesses (`pyright-langserver`, `debugpy`, the Run command, `pip`/`npm`/etc.) directly on the Bridge Daemon's own host/container — not inside the Workspace container via `devpod ssh`. This doesn't show with a single active test Workspace (everything runs against the same cloned filesystem), but it's wrong for several concurrent Workspaces, the real production case. Closing this is a bigger change (routing every subprocess through `devpod ssh <workspace> -- <command>`) that wasn't in scope for this pass.
 
-**Tier gestionado (AWS)**: el custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, en el submódulo `backend/` del coordinador) hoy solo provisiona la VPC y el cluster ECS compartidos — el Service/task definition del propio daemon y el push de esta imagen a ECR no están implementados. Ninguno de los dos estaba dentro del alcance de `specs/001-core-development-flows/tasks.md`.
+**Managed tier (AWS)**: the custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, in the coordinator's `backend/` submodule) today only provisions the shared VPC and ECS cluster — the daemon's own Service/task definition and pushing this image to ECR aren't implemented. Neither was in scope for `specs/001-core-development-flows/tasks.md`. For a managed deployment, `LocalFileStore`/`entitlements.NewGate(nil)` in `main.go` would also need to be swapped for `SecretsManagerStore`/a real `entitlements.DynamoDBStore` — the seam already exists (`gitmanager.SecretStore`, `entitlements.Store` are interfaces), only the real-AWS-client construction in `main.go` is missing.
