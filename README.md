@@ -37,14 +37,18 @@ Ver `specs/001-core-development-flows/contracts/websocket-protocol.md` del repos
 | `--port` | `8443` | Puerto de escucha |
 | `--tls-cert` | *(requerido)* | Ruta al certificado TLS |
 | `--tls-key` | *(requerido)* | Ruta a la llave privada TLS |
+| `--workspace-dir` | `/var/lib/codeeditor/workspaces` | Raíz donde se clonan los Workspaces (equivalente local al mount de EFS) |
+| `--secrets-dir` | `/var/lib/codeeditor/secrets` | Raíz de `gitmanager.LocalFileStore` — credenciales de git self-hosted, sin AWS |
+| `--mosh-udp-port-range` | `60000-61000` | Rango de puertos UDP que valida el checklist de `/handshake` |
 
 ## Cómo correr localmente
 
 ```bash
-go run ./cmd/bridged --port 8443 --tls-cert dev.crt --tls-key dev.key
+go run ./cmd/bridged --port 8443 --tls-cert dev.crt --tls-key dev.key \
+  --workspace-dir ./tmp/workspaces --secrets-dir ./tmp/secrets
 ```
 
-> **Nota**: en su estado actual esto levanta un listener TLS que no sirve ningún canal — ver el gap documentado en `CLAUDE.md` y `specs/001-core-development-flows/tasks.md`. Útil para probar el binario compila y arranca, no para probar un flujo end-to-end todavía.
+`main.go` registra todos los canales de `internal/ws` con implementación real: `lsp`, `shell`, `run`, `git`, `debug` — verificado sirviendo tráfico real de punta a punta (clonado real de un repo público, generación real de una llave SSH ed25519, detección real de `devcontainer.json`). `claude` no tiene handler propio — se empuja desde el `OutputWatcher` del canal `shell` (contracts/auth-flows.md), no hace falta uno. `entitlements` tampoco — el único llamador de `Gate.CheckQuota` es el `Provisioner`, alcanzado por `POST /projects/provision`, no un envelope WS directo (nada en la app lo manda tampoco: `EntitlementsService.swift` consulta `Amplify.API` directo). `fs` sigue sin ninguna implementación — nunca se construyó el sync del árbol de archivos, ver `specs/001-core-development-flows/tasks.md` T103.
 
 ## Tests
 
@@ -74,12 +78,18 @@ docker build -t codeeditor-bridge-daemon .
 docker run --rm -p 8443:8443 \
   -v "$(pwd)/dev.crt:/etc/bridged/tls.crt:ro" \
   -v "$(pwd)/dev.key:/etc/bridged/tls.key:ro" \
+  -v codeeditor-workspaces:/var/lib/codeeditor/workspaces \
+  -v codeeditor-secrets:/var/lib/codeeditor/secrets \
   -v /var/run/docker.sock:/var/run/docker.sock \
   codeeditor-bridge-daemon
 ```
 
+Los dos volúmenes nombrados (`codeeditor-workspaces`, `codeeditor-secrets`) son opcionales pero recomendados — sin ellos, los Workspaces clonados y las credenciales de git generadas se pierden cada vez que el contenedor se recrea.
+
 El `Dockerfile` es la imagen del daemon en sí (Go binario + `tmux`/`git`/`ssh`/CLI de `devpod`/CLI de `docker`) — **no** es donde viven los Workspaces de cada proyecto. Esos los crea `devpod up` bajo demanda a partir del `devcontainer.json` de cada repositorio (detectado o generado, `internal/gitmanager`) — no hay ni debe haber una imagen fija de "workspace de CodeEditor" en ningún registry, es justamente lo que resuelve usar DevPod en vez de mantener imágenes propias por lenguaje. El socket de Docker del host se monta (no Docker-in-Docker) para que `devpod` cree esos Workspaces como contenedores hermanos, no hijos, del contenedor del daemon.
 
-**Gaps reales que bloquean una prueba end-to-end hoy**, incluso con la imagen: (1) `cmd/bridged/main.go` todavía no registra ningún handler de `internal/ws` (ver la nota arriba) — el contenedor levanta pero no sirve tráfico real de ningún canal; (2) `internal/gitmanager.SecretStore` solo tiene una implementación contra AWS Secrets Manager (`SecretsManagerStore`) — no hay un `SecretStore` local/en-archivo, así que generar/registrar credenciales de git no funciona sin una cuenta AWS real, incluso en self-hosted puro. El Entitlements Gate sí funciona sin AWS en self-hosted — `entitlements.Gate.CheckQuota` nunca consulta DynamoDB cuando `HostKind == "self-hosted"` (`02_arquitectura_solucion.md` §3.4 pt.4), así que ese canal no es un bloqueo.
+**Verificado end-to-end en self-hosted** (fuera del contenedor, mismo binario): `/handshake` responde con el checklist real; `POST /git-credentials/ssh-key/generate` genera y almacena una llave ed25519 real; `POST /projects/provision` clona un repositorio público real, detecta/genera su `devcontainer.json`, y llega hasta el paso `devpod-up` — que solo falla porque `devpod` no estaba instalado en la máquina donde se corrió esta verificación puntual (si está instalado, como en la imagen de Docker, ese paso también corre real).
+
+**Gap real que sigue abierto**: `internal/ws/lsp_proxy.go`, `internal/debug` (adaptadores DAP), `internal/devpod` (ejecución de Run) e `internal/bootstrap.Executor` invocan sus subprocesos (`pyright-langserver`, `debugpy`, el comando de Run, `pip`/`npm`/etc.) directamente en el host/contenedor del propio Bridge Daemon — no dentro del contenedor del Workspace vía `devpod ssh`. Con un solo Workspace de prueba activo esto no se nota (todo corre en el mismo filesystem clonado), pero es incorrecto para múltiples Workspaces simultáneos, que es el caso real de producción. Cerrar esto es un cambio más grande (enrutar cada subproceso a través de `devpod ssh <workspace> -- <comando>`) que no estaba en el alcance de esta pasada.
 
 **Tier gestionado (AWS)**: el custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, en el submódulo `backend/` del coordinador) hoy solo provisiona la VPC y el cluster ECS compartidos — el Service/task definition del propio daemon y el push de esta imagen a ECR no están implementados. Ninguno de los dos estaba dentro del alcance de `specs/001-core-development-flows/tasks.md`.
