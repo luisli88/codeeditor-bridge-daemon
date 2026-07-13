@@ -64,4 +64,22 @@ go build -o bridged ./cmd/bridged
 ./bridged --port 8443 --tls-cert /etc/codeeditor/tls.crt --tls-key /etc/codeeditor/tls.key
 ```
 
-**Tier gestionado (AWS)**: el custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, en el submódulo `backend/` del coordinador) hoy solo provisiona la VPC y el cluster ECS compartidos — el Service/task definition del propio daemon, la imagen de contenedor (no hay `Dockerfile` en este repo todavía) y el wiring de credenciales AWS (DynamoDB para entitlements, Secrets Manager para credenciales de git) no están implementados. Antes de poder desplegar esto en ECS Fargate hace falta: (1) cablear `cmd/bridged/main.go` para registrar los handlers de `internal/ws` y construir los clientes AWS reales, (2) un `Dockerfile`, y (3) el Service/task definition en el custom stack. Ninguno de los tres estaba dentro del alcance de `specs/001-core-development-flows/tasks.md`.
+**Local con Docker** (para probar rápido sin systemd/launchd):
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout dev.key -out dev.crt -subj "/CN=localhost"
+
+docker build -t codeeditor-bridge-daemon .
+docker run --rm -p 8443:8443 \
+  -v "$(pwd)/dev.crt:/etc/bridged/tls.crt:ro" \
+  -v "$(pwd)/dev.key:/etc/bridged/tls.key:ro" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  codeeditor-bridge-daemon
+```
+
+El `Dockerfile` es la imagen del daemon en sí (Go binario + `tmux`/`git`/`ssh`/CLI de `devpod`/CLI de `docker`) — **no** es donde viven los Workspaces de cada proyecto. Esos los crea `devpod up` bajo demanda a partir del `devcontainer.json` de cada repositorio (detectado o generado, `internal/gitmanager`) — no hay ni debe haber una imagen fija de "workspace de CodeEditor" en ningún registry, es justamente lo que resuelve usar DevPod en vez de mantener imágenes propias por lenguaje. El socket de Docker del host se monta (no Docker-in-Docker) para que `devpod` cree esos Workspaces como contenedores hermanos, no hijos, del contenedor del daemon.
+
+**Gaps reales que bloquean una prueba end-to-end hoy**, incluso con la imagen: (1) `cmd/bridged/main.go` todavía no registra ningún handler de `internal/ws` (ver la nota arriba) — el contenedor levanta pero no sirve tráfico real de ningún canal; (2) `internal/gitmanager.SecretStore` solo tiene una implementación contra AWS Secrets Manager (`SecretsManagerStore`) — no hay un `SecretStore` local/en-archivo, así que generar/registrar credenciales de git no funciona sin una cuenta AWS real, incluso en self-hosted puro. El Entitlements Gate sí funciona sin AWS en self-hosted — `entitlements.Gate.CheckQuota` nunca consulta DynamoDB cuando `HostKind == "self-hosted"` (`02_arquitectura_solucion.md` §3.4 pt.4), así que ese canal no es un bloqueo.
+
+**Tier gestionado (AWS)**: el custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, en el submódulo `backend/` del coordinador) hoy solo provisiona la VPC y el cluster ECS compartidos — el Service/task definition del propio daemon y el push de esta imagen a ECR no están implementados. Ninguno de los dos estaba dentro del alcance de `specs/001-core-development-flows/tasks.md`.
