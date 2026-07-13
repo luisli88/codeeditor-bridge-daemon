@@ -28,16 +28,40 @@ tests/
 
 Ver `specs/001-core-development-flows/contracts/websocket-protocol.md` del repositorio coordinador para el contrato completo del protocolo multiplexado.
 
+## Configuración
+
+`cmd/bridged` se configura hoy solo por flags de línea de comandos (sin variables de entorno ni archivo de config):
+
+| Flag | Default | Descripción |
+|---|---|---|
+| `--port` | `8443` | Puerto de escucha |
+| `--tls-cert` | *(requerido)* | Ruta al certificado TLS |
+| `--tls-key` | *(requerido)* | Ruta a la llave privada TLS |
+
 ## Cómo correr localmente
 
 ```bash
 go run ./cmd/bridged --port 8443 --tls-cert dev.crt --tls-key dev.key
 ```
 
+> **Nota**: en su estado actual esto levanta un listener TLS que no sirve ningún canal — ver el gap documentado en `CLAUDE.md` y `specs/001-core-development-flows/tasks.md`. Útil para probar el binario compila y arranca, no para probar un flujo end-to-end todavía.
+
 ## Tests
 
 ```bash
 go test ./... -cover
+golangci-lint run ./...
 ```
 
 Cobertura objetivo: ≥90% en `internal/entitlements`, `internal/gitmanager` e `internal/session` — ver Principio V de la constitución del repositorio coordinador.
+
+## Despliegue
+
+**Self-hosted (Mac mini, VPS, cuenta AWS propia)**: compilar el binario y correrlo como servicio persistente (systemd/launchd) en un host con `tmux`, Docker (o el motor de contenedores configurado como target de DevPod) y el DevPod CLI instalados.
+
+```bash
+go build -o bridged ./cmd/bridged
+./bridged --port 8443 --tls-cert /etc/codeeditor/tls.crt --tls-key /etc/codeeditor/tls.key
+```
+
+**Tier gestionado (AWS)**: el custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, en el submódulo `backend/` del coordinador) hoy solo provisiona la VPC y el cluster ECS compartidos — el Service/task definition del propio daemon, la imagen de contenedor (no hay `Dockerfile` en este repo todavía) y el wiring de credenciales AWS (DynamoDB para entitlements, Secrets Manager para credenciales de git) no están implementados. Antes de poder desplegar esto en ECS Fargate hace falta: (1) cablear `cmd/bridged/main.go` para registrar los handlers de `internal/ws` y construir los clientes AWS reales, (2) un `Dockerfile`, y (3) el Service/task definition en el custom stack. Ninguno de los tres estaba dentro del alcance de `specs/001-core-development-flows/tasks.md`.
