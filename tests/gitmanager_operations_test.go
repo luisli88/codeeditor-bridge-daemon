@@ -59,6 +59,27 @@ func TestStatus_UntrackedAndModifiedFiles(t *testing.T) {
 	require.Equal(t, "untracked", byPath["new.txt"])
 }
 
+func TestStatus_DeletedAndStagedFiles(t *testing.T) {
+	ops, dir := newTestRepo(t)
+	writeFile(t, dir, "deleted.txt", "v1\n")
+	writeFile(t, dir, "staged.txt", "v1\n")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-q", "-m", "initial")
+	require.NoError(t, os.Remove(filepath.Join(dir, "deleted.txt")))
+	writeFile(t, dir, "staged.txt", "v2\n")
+	runGit(t, dir, "add", "staged.txt")
+
+	files, err := ops.Status(context.Background(), "ws-1")
+
+	require.NoError(t, err)
+	byPath := map[string]string{}
+	for _, f := range files {
+		byPath[f.Path] = f.Status
+	}
+	require.Equal(t, "deleted", byPath["deleted.txt"])
+	require.Equal(t, "staged", byPath["staged.txt"])
+}
+
 func TestStageAndCommit_ReturnsCommitHash(t *testing.T) {
 	ops, dir := newTestRepo(t)
 	writeFile(t, dir, "file.txt", "content\n")
@@ -83,6 +104,27 @@ func TestDiff_ReflectsUncommittedChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, diff, "-v1")
 	require.Contains(t, diff, "+v2")
+}
+
+func TestDiff_StagedAndScopedToPath(t *testing.T) {
+	ops, dir := newTestRepo(t)
+	writeFile(t, dir, "a.txt", "v1\n")
+	writeFile(t, dir, "b.txt", "v1\n")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-q", "-m", "initial")
+	writeFile(t, dir, "a.txt", "v2\n")
+	writeFile(t, dir, "b.txt", "v2\n")
+	runGit(t, dir, "add", "a.txt")
+
+	staged, err := ops.Diff(context.Background(), "ws-1", true, "")
+	require.NoError(t, err)
+	require.Contains(t, staged, "a.txt")
+	require.NotContains(t, staged, "b.txt")
+
+	scoped, err := ops.Diff(context.Background(), "ws-1", false, "b.txt")
+	require.NoError(t, err)
+	require.Contains(t, scoped, "b.txt")
+	require.NotContains(t, scoped, "a.txt")
 }
 
 func TestBranches_ListsAndMarksCurrent(t *testing.T) {
@@ -193,4 +235,86 @@ func TestMergeConflict_ManualResolution_WritesExactText(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(dir, "a.txt"))
 	require.NoError(t, err)
 	require.Equal(t, "merged-by-hand\n", string(content))
+}
+
+// FR-033: Push publishes local commits to the registered remote — a
+// local bare repo stands in for the real git provider so this exercises
+// real `git push`, not a fake.
+func TestPush_ToRemote_PublishesCommit(t *testing.T) {
+	central := t.TempDir()
+	runGit(t, central, "init", "-q", "--bare", "-b", "main")
+
+	// Cloning (rather than `git init` + manually adding a remote) is what
+	// sets up the upstream tracking branch `git push` needs — the same
+	// setup Cloner.Clone leaves a real Workspace in.
+	dir := t.TempDir()
+	runGit(t, dir, "clone", "-q", central, ".")
+	runGit(t, dir, "config", "user.email", "dev@example.com")
+	runGit(t, dir, "config", "user.name", "Dev")
+	ops := gitmanager.NewOperations(func(workspaceID string) string { return dir })
+
+	writeFile(t, dir, "file.txt", "content\n")
+	runGit(t, dir, "add", "file.txt")
+	runGit(t, dir, "commit", "-q", "-m", "initial")
+
+	err := ops.Push(context.Background(), "ws-1", nil)
+
+	require.NoError(t, err)
+	logOut := runGit(t, central, "log", "--oneline")
+	require.Contains(t, logOut, "initial")
+}
+
+func TestPull_FromRemote_FetchesNewCommit(t *testing.T) {
+	central := t.TempDir()
+	runGit(t, central, "init", "-q", "--bare", "-b", "main")
+
+	seedDir := t.TempDir()
+	runGit(t, seedDir, "clone", "-q", central, ".")
+	runGit(t, seedDir, "config", "user.email", "dev@example.com")
+	runGit(t, seedDir, "config", "user.name", "Dev")
+	writeFile(t, seedDir, "shared.txt", "v1\n")
+	runGit(t, seedDir, "add", ".")
+	runGit(t, seedDir, "commit", "-q", "-m", "shared v1")
+	runGit(t, seedDir, "push", "-q", "origin", "main")
+
+	dir := t.TempDir()
+	runGit(t, dir, "clone", "-q", central, ".")
+	ops := gitmanager.NewOperations(func(workspaceID string) string { return dir })
+
+	otherDir := t.TempDir()
+	runGit(t, otherDir, "clone", "-q", central, ".")
+	runGit(t, otherDir, "config", "user.email", "dev@example.com")
+	runGit(t, otherDir, "config", "user.name", "Dev")
+	writeFile(t, otherDir, "shared.txt", "v2\n")
+	runGit(t, otherDir, "commit", "-q", "-am", "shared v2")
+	runGit(t, otherDir, "push", "-q", "origin", "main")
+
+	err := ops.Pull(context.Background(), "ws-1", nil)
+
+	require.NoError(t, err)
+	content, err := os.ReadFile(filepath.Join(dir, "shared.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "v2\n", string(content))
+}
+
+func TestPush_UnsupportedCredentialKind_ReturnsError(t *testing.T) {
+	ops, dir := newTestRepo(t)
+	writeFile(t, dir, "file.txt", "v1\n")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-q", "-m", "initial")
+
+	err := ops.Push(context.Background(), "ws-1", &gitmanager.CloneCredential{Kind: gitmanager.CredentialKind("unknown")})
+
+	require.Error(t, err)
+}
+
+func TestPull_UnsupportedCredentialKind_ReturnsError(t *testing.T) {
+	ops, dir := newTestRepo(t)
+	writeFile(t, dir, "file.txt", "v1\n")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-q", "-m", "initial")
+
+	err := ops.Pull(context.Background(), "ws-1", &gitmanager.CloneCredential{Kind: gitmanager.CredentialKind("unknown")})
+
+	require.Error(t, err)
 }

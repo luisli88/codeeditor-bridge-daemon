@@ -129,3 +129,31 @@ func TestReauthenticate_StillInvalid_ReturnsError(t *testing.T) {
 
 	require.Error(t, err)
 }
+
+func TestGenerateSSHKey_SecretStoreFails_ReturnsError(t *testing.T) {
+	manager := gitmanager.NewCredentialManager(failingSecretStore{}, &fakeValidator{shouldFail: false})
+
+	_, _, err := manager.GenerateSSHKey(context.Background(), "user-1", "My Key", "github.com")
+
+	require.Error(t, err)
+}
+
+func TestRegisterPAT_SecretStoreFails_ReturnsError(t *testing.T) {
+	manager := gitmanager.NewCredentialManager(failingSecretStore{}, &fakeValidator{shouldFail: false})
+
+	_, err := manager.RegisterPAT(context.Background(), "user-1", "Token", "github.com", "tok")
+
+	require.Error(t, err)
+}
+
+func TestReauthenticate_SecretStoreFails_ReturnsError(t *testing.T) {
+	store := newFakeSecretStore()
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: false})
+	cred, err := manager.RegisterPAT(context.Background(), "user-1", "My Token", "github.com", "old-token")
+	require.NoError(t, err)
+
+	failingManager := gitmanager.NewCredentialManager(failingSecretStore{}, &fakeValidator{shouldFail: false})
+	err = failingManager.Reauthenticate(context.Background(), &cred, "new-token")
+
+	require.Error(t, err)
+}

@@ -3,8 +3,12 @@ package tests
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -19,6 +23,23 @@ func newTestMux() (*http.ServeMux, *fakeSecretStore) {
 	mux := http.NewServeMux()
 	gitmanager.RegisterRoutes(mux, manager)
 	return mux, store
+}
+
+type failingSecretStore struct{}
+
+func (failingSecretStore) Put(ctx context.Context, ref, value string) error {
+	return errors.New("secret store unavailable")
+}
+
+func (failingSecretStore) Get(ctx context.Context, ref string) (string, error) {
+	return "", errors.New("secret store unavailable")
+}
+
+func newFailingStoreTestMux() *http.ServeMux {
+	manager := gitmanager.NewCredentialManager(failingSecretStore{}, &fakeValidator{shouldFail: false})
+	mux := http.NewServeMux()
+	gitmanager.RegisterRoutes(mux, manager)
+	return mux
 }
 
 func postJSON(t *testing.T, mux *http.ServeMux, path string, body any) *httptest.ResponseRecorder {
@@ -126,6 +147,100 @@ func TestRegisterPATHandler_InvalidBody_ReturnsBadRequest(t *testing.T) {
 
 	req := httptest.NewRequestWithContext(
 		context.Background(), http.MethodPost, "/git-credentials/pat", strings.NewReader("not json"),
+	)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestImportSSHKeyHandler_ValidKey_ReturnsCredential(t *testing.T) {
+	mux, _ := newTestMux()
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519")
+	keygenCmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", keyPath, "-q")
+	require.NoError(t, keygenCmd.Run())
+	privateKeyPEM, err := os.ReadFile(keyPath)
+	require.NoError(t, err)
+
+	rec := postJSON(t, mux, "/git-credentials/ssh-key/import", map[string]string{
+		"ownerUserId": "user-1", "alias": "Imported Key", "domain": "github.com",
+		"privateKeyPem": string(privateKeyPEM),
+	})
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Credential gitmanager.Credential `json:"credential"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, gitmanager.CredentialKindSSHKey, resp.Credential.Kind)
+}
+
+// Exercises writeError (via importSSHKeyHandler rejecting an invalid key).
+func TestImportSSHKeyHandler_InvalidKey_ReturnsUnprocessableEntity(t *testing.T) {
+	mux, _ := newTestMux()
+
+	rec := postJSON(t, mux, "/git-credentials/ssh-key/import", map[string]string{
+		"ownerUserId": "user-1", "alias": "Bad Key", "domain": "github.com",
+		"privateKeyPem": "not a real key",
+	})
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestRegisterPATHandler_SecretStoreFails_ReturnsUnprocessableEntity(t *testing.T) {
+	mux := newFailingStoreTestMux()
+
+	rec := postJSON(t, mux, "/git-credentials/pat", map[string]string{
+		"ownerUserId": "user-1", "alias": "GitHub Token", "domain": "github.com", "token": "ghp_token",
+	})
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestGenerateSSHKeyHandler_SecretStoreFails_ReturnsUnprocessableEntity(t *testing.T) {
+	mux := newFailingStoreTestMux()
+
+	rec := postJSON(t, mux, "/git-credentials/ssh-key/generate", map[string]string{
+		"ownerUserId": "user-1", "alias": "My Key", "domain": "github.com",
+	})
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestRegisterGitHubDerivedHandler_SecretStoreFails_ReturnsUnprocessableEntity(t *testing.T) {
+	mux := newFailingStoreTestMux()
+
+	rec := postJSON(t, mux, "/git-credentials/github-derived", map[string]string{
+		"ownerUserId": "user-1", "accessToken": "gho_token",
+	})
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+// FR-020: reauthenticating with a credential that still fails validation
+// reports an error rather than silently marking it verified.
+func TestReauthenticateHandler_StillInvalid_ReturnsUnprocessableEntity(t *testing.T) {
+	store := newFakeSecretStore()
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: true})
+	mux := http.NewServeMux()
+	gitmanager.RegisterRoutes(mux, manager)
+
+	rec := postJSON(t, mux, "/git-credentials/reauthenticate", map[string]any{
+		"credential": gitmanager.Credential{
+			ID: "cred-1", OwnerUserID: "user-1", Alias: "Token", Domain: "github.com",
+			Kind: gitmanager.CredentialKindPAT, Status: gitmanager.CredentialStatusRevoked, SecretRef: "ref/1",
+		},
+		"newSecret": "still-bad-token",
+	})
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestReauthenticateHandler_InvalidBody_ReturnsBadRequest(t *testing.T) {
+	mux, _ := newTestMux()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(), http.MethodPost, "/git-credentials/reauthenticate", strings.NewReader("not json"),
 	)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
