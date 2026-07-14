@@ -26,6 +26,7 @@ RUN apk add --no-cache \
         git \
         openssh-client \
         docker-cli \
+        mosh \
     # DevPod CLI (research.md — no stable Go SDK, the daemon shells out
     # to the real binary via internal/devpod.SubprocessRunner).
     && wget -qO /usr/local/bin/devpod \
