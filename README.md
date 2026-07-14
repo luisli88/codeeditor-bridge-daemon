@@ -68,6 +68,8 @@ go build -o bridged ./cmd/bridged
 ./bridged --port 8443 --tls-cert /etc/codeeditor/tls.crt --tls-key /etc/codeeditor/tls.key
 ```
 
+Doing all of this by hand is exactly what `app/Sources/Features/RemoteSetup/RemoteSetupService.swift` automates over SSH from the app itself — it downloads a prebuilt binary instead of building one (`.github/workflows/release.yml` publishes `bridged-linux-{amd64,arm64}` as GitHub Release assets on every tag; this repo is public specifically so those assets are reachable with no credentials from a fresh host) and sets it up as a systemd service (falling back to a detached process if the host has no systemd). See that file's doc comment for the exact scope (apt-only, root/passwordless-sudo required).
+
 **Testing the app's actual connection flow against something SSH-reachable**: `dev/fake-remote-host/` — a container that simulates a bare self-hosted machine (SSH access, Docker, `mosh-server`) instead of just running this Dockerfile with its port published straight to `localhost`. You SSH in and set the daemon up yourself, exactly like the self-hosted steps above, against a fake VPS instead of a real one — see `dev/fake-remote-host/README.md`. Verified end to end: real SSH password login, `docker info` from inside it against the real host's Docker (after fixing a docker.sock GID mismatch — see that README), and all three `/handshake` checklist items (`bridge-daemon-reachable`, `container-engine`, `mosh`) come back `verified`, both from inside the container and through the app's own connection.
 
 **Local with Docker** (for fast iteration without systemd/launchd):
