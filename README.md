@@ -68,6 +68,8 @@ go build -o bridged ./cmd/bridged
 ./bridged --port 8443 --tls-cert /etc/codeeditor/tls.crt --tls-key /etc/codeeditor/tls.key
 ```
 
+**Testing the app's actual connection flow against something SSH-reachable**: `dev/fake-remote-host/` — a container that simulates a bare self-hosted machine (SSH access, Docker, `mosh-server`) instead of just running this Dockerfile with its port published straight to `localhost`. You SSH in and set the daemon up yourself, exactly like the self-hosted steps above, against a fake VPS instead of a real one — see `dev/fake-remote-host/README.md`. Verified end to end: real SSH password login, `docker info` from inside it against the real host's Docker (after fixing a docker.sock GID mismatch — see that README), and all three `/handshake` checklist items (`bridge-daemon-reachable`, `container-engine`, `mosh`) come back `verified`, both from inside the container and through the app's own connection.
+
 **Local with Docker** (for fast iteration without systemd/launchd):
 
 ```bash
@@ -89,6 +91,8 @@ The two named volumes (`codeeditor-workspaces`, `codeeditor-secrets`) are option
 The `Dockerfile` is the daemon's own image (Go binary + `tmux`/`git`/`ssh`/the `devpod` CLI/the `docker` CLI) — it is **not** where each project's Workspace lives. Those are created on demand by `devpod up` from each repository's own `devcontainer.json` (detected or generated, `internal/gitmanager`) — there is no, and shouldn't be, a fixed "CodeEditor workspace" image in any registry; that's exactly what using DevPod instead of maintaining per-language images solves. The host's Docker socket is mounted (not Docker-in-Docker) so `devpod` creates those Workspaces as sibling containers, not children, of the daemon's own container.
 
 **Verified end to end in self-hosted mode** (outside the container, same binary): `/handshake` responds with the machine's real checklist; `POST /git-credentials/ssh-key/generate` generates and stores a real ed25519 key; `POST /projects/provision` actually clones a real public repository, detects/generates its `devcontainer.json`, and reaches the `devpod-up` step — which only fails because `devpod` wasn't installed on the machine this particular check was run on (it is in the Docker image, so that step runs for real there too).
+
+**The `Dockerfile` itself is also verified** with a real `docker build`/`docker run` (not just reasoned through) — `/handshake` responded `bridge-daemon-reachable: verified` from the built image. One real fix that came out of it: bind-mounting a single file to a path whose parent directory doesn't exist yet in the image can make Docker create a *directory* there instead (hit this on Docker Desktop for Mac) — `/etc/bridged` is now pre-created in the image to avoid it.
 
 **Real gap still open**: `internal/ws/lsp_proxy.go`, `internal/debug` (DAP adapters), `internal/devpod` (Run execution), and `internal/bootstrap.Executor` all invoke their subprocesses (`pyright-langserver`, `debugpy`, the Run command, `pip`/`npm`/etc.) directly on the Bridge Daemon's own host/container — not inside the Workspace container via `devpod ssh`. This doesn't show with a single active test Workspace (everything runs against the same cloned filesystem), but it's wrong for several concurrent Workspaces, the real production case. Closing this is a bigger change (routing every subprocess through `devpod ssh <workspace> -- <command>`) that wasn't in scope for this pass.
 

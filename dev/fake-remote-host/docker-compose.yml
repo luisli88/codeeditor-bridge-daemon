@@ -1,0 +1,22 @@
+services:
+  fake-remote-host:
+    build:
+      context: ../..
+      dockerfile: dev/fake-remote-host/Dockerfile
+    ports:
+      - "2222:22"
+      - "8443:8443"
+    volumes:
+      # Docker-outside-of-Docker (not DinD) — `docker info`/`devpod up` run
+      # from inside this container control the *real* Docker host, same
+      # pattern as ../../Dockerfile (the daemon's own image). Anything you
+      # `docker run` from an SSH session in here is a sibling of this
+      # container, not nested inside it — its ports need their own -p on
+      # the real host if you want to reach them.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - codeeditor-fake-host-workspaces:/var/lib/codeeditor/workspaces
+      - codeeditor-fake-host-secrets:/var/lib/codeeditor/secrets
+
+volumes:
+  codeeditor-fake-host-workspaces:
+  codeeditor-fake-host-secrets:

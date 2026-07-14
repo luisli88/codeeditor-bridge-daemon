@@ -36,6 +36,11 @@ RUN apk add --no-cache \
     && chmod +x /usr/local/bin/devpod
 
 COPY --from=build /out/bridged /usr/local/bin/bridged
+# Pre-create the mount point — without it, bind-mounting a single file to
+# a path whose parent doesn't exist yet in the image makes some Docker
+# setups create a *directory* there instead of the file (confirmed on
+# Docker Desktop for Mac), which then fails at read time, not mount time.
+RUN mkdir -p /etc/bridged
 
 EXPOSE 8443
 ENTRYPOINT ["bridged"]
