@@ -1,0 +1,38 @@
+name: Release
+
+# Cross-compiled linux binaries for RemoteSetupService (app's guided
+# self-hosted setup wizard) to download directly onto a fresh machine —
+# no Docker/container engine required just to run `bridged` itself. See
+# app/Sources/Services/RemoteSetupService.swift and README.md "Self-hosted".
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -o bridged-linux-${{ matrix.arch }} ./cmd/bridged
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridged-linux-${{ matrix.arch }}
+          path: bridged-linux-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
