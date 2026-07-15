@@ -6,11 +6,6 @@ services:
     ports:
       - "2222:22"
       - "8443:8443"
-    environment:
-      # See the long bind-mount comment below — entrypoint.sh drops this
-      # into /etc/environment so it also reaches the interactive SSH
-      # session you set the daemon up in, not just this container's PID 1.
-      - CODEEDITOR_DATA_DIR=${HOME}/codeeditor-data
     volumes:
       # Docker-outside-of-Docker (not DinD) — `docker info`/`devpod up` run
       # from inside this container control the *real* Docker host, same
@@ -21,26 +16,34 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # `devpod up` (invoked from inside this container) asks the *real*
       # Docker host to bind-mount a Workspace's path into the sibling
-      # container it creates — that only resolves if the path is real and
-      # identical on both sides. A named volume's real path
-      # (/var/lib/docker/volumes/<name>/_data) is NOT that path, so
-      # `devpod up` fails with "bind source path does not exist:
-      # /var/lib/codeeditor/workspaces/<id>" — confirmed by hand against a
-      # real `devpod up`, not just reasoned through.
+      # container it creates — resolved by that real host's own dockerd,
+      # against *its own* filesystem, using the literal path string
+      # `bridged` cloned into (`/var/lib/codeeditor/workspaces/<id>`, the
+      # compiled-in --workspace-dir default — deliberately NOT overridden
+      # anywhere, since a real self-hosted machine has no reason to ever
+      # override it, and this container needs to behave exactly like one
+      # once the guided setup wizard deploys onto it with unmodified
+      # flags). A named volume's real path
+      # (/var/lib/docker/volumes/<name>/_data) is NOT that literal string,
+      # so `devpod up` fails with "bind source path does not exist:
+      # /var/lib/codeeditor/workspaces/<id>" — confirmed by hand.
       #
-      # ${HOME} (not /var/lib/codeeditor, unlike a real self-hosted
-      # machine — see ../../README.md "Self-hosted") avoids needing sudo
-      # on your own dev machine. It's NOT arbitrary: on Colima (this
-      # machine's Docker backend — `docker context ls`), the VM's
-      # virtiofs mount only maps UID/GID correctly for paths under the
-      # real $HOME; a sibling path like /Users/Shared *looks* mounted
-      # (`colima ssh -- ls /Users/Shared` shows it) but is root:root and
-      # unwritable by any other UID — confirmed by hand, cost a failed
-      # provisioning run to find. $HOME is also why CODEEDITOR_DATA_DIR
-      # exists above: this value must stay identical inside the SSH
-      # session you set the daemon up in below, and that session's own
-      # $HOME is /home/developer (the `developer` Linux user), not this
-      # Mac's $HOME — a bare $HOME there would silently break path parity
-      # all over again.
-      - ${HOME}/codeeditor-data/workspaces:${HOME}/codeeditor-data/workspaces
-      - ${HOME}/codeeditor-data/secrets:${HOME}/codeeditor-data/secrets
+      # This machine's Docker backend is Colima (`docker context ls`) —
+      # its dockerd runs *inside a Linux VM*, not on macOS directly, so
+      # the bind-mount source has to be real *inside that VM's own
+      # filesystem*, not on macOS at all. Colima's default `mounts: []`
+      # only auto-shares $HOME into the VM (confirmed: /Users/Shared
+      # *looks* mounted there too but is root:root and unwritable — a
+      # dead end tried first), and /var/lib isn't under $HOME — so
+      # `/var/lib/codeeditor/{workspaces,secrets}` has to be created
+      # directly inside the VM, once:
+      #   colima ssh -- sudo mkdir -p /var/lib/codeeditor/workspaces /var/lib/codeeditor/secrets
+      #   colima ssh -- sudo chown -R $(id -u):$(id -g) /var/lib/codeeditor
+      # (Colima's VM allows passwordless sudo for its own default user by
+      # default — confirmed by hand — so this needs no macOS admin
+      # password, only whatever `colima ssh` itself needs.) A real
+      # self-hosted machine (no DooD, no VM indirection) never needs any
+      # of this — `bridged`'s own --workspace-dir/--secrets-dir defaults
+      # already point at real, local directories there.
+      - /var/lib/codeeditor/workspaces:/var/lib/codeeditor/workspaces
+      - /var/lib/codeeditor/secrets:/var/lib/codeeditor/secrets
