@@ -78,8 +78,14 @@ func DetectLanguages(repoPath string) []string {
 }
 
 // DetectOrGenerate reads repoPath's own devcontainer.json (FR-026) if
-// present, otherwise generates a default one from the detected
-// languages — always editable by the caller before provisioning.
+// present, otherwise generates a default one from the detected languages
+// and writes it to repoPath/.devcontainer/devcontainer.json — `devpod up`
+// only ever reads that file off disk, it has no API for passing a config
+// in-memory, so a generated config that's never written is invisible to
+// it and `devpod up` silently falls back to its own (cruder) detection
+// instead. Always editable by the caller before provisioning (FR-026);
+// an already-present file is left untouched since it's already what
+// `devpod up` will read.
 func DetectOrGenerate(repoPath string) (DevcontainerConfig, error) {
 	for _, relPath := range devcontainerPaths {
 		data, err := os.ReadFile(filepath.Join(repoPath, relPath))
@@ -92,7 +98,24 @@ func DetectOrGenerate(repoPath string) (DevcontainerConfig, error) {
 		}
 		return config, nil
 	}
-	return DefaultConfigFor(DetectLanguages(repoPath)), nil
+
+	config := DefaultConfigFor(DetectLanguages(repoPath))
+	if err := writeDevcontainer(repoPath, config); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+func writeDevcontainer(repoPath string, config DevcontainerConfig) error {
+	dir := filepath.Join(repoPath, ".devcontainer")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "devcontainer.json"), data, 0o644)
 }
 
 // DefaultConfigFor generates a minimal devcontainer.json for the given

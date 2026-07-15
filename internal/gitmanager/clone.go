@@ -94,12 +94,24 @@ func (c *Cloner) Clone(
 	// \n between updates — split on \r too, or every intermediate
 	// percentage gets silently coalesced into one giant "line".
 	scanner.Split(scanLinesOrCarriageReturns)
+	var lastLine string
 	for scanner.Scan() {
-		reportCloneProgressLine(scanner.Text(), reporter)
+		line := scanner.Text()
+		if line != "" {
+			lastLine = line
+		}
+		reportCloneProgressLine(line, reporter)
 	}
 
 	if err := cmd.Wait(); err != nil {
 		reporter.Report(CloneProgress{Phase: "clone", Event: "error"})
+		// err.Error() alone is just "exit status 128" — meaningless to a
+		// Desarrollador. git always prints the real reason ("repository
+		// not found", "could not read Username", ...) as its last stderr
+		// line before exiting, so surface that instead when there is one.
+		if lastLine != "" {
+			return fmt.Errorf("gitmanager: clone %s: %s", repositoryURL, lastLine)
+		}
 		return fmt.Errorf("gitmanager: clone %s: %w", repositoryURL, err)
 	}
 	reporter.Report(CloneProgress{Phase: "clone", Event: "done"})

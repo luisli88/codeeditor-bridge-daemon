@@ -78,24 +78,39 @@ Doing all of this by hand is exactly what `app/Sources/Features/RemoteSetup/Remo
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout dev.key -out dev.crt -subj "/CN=localhost"
 
+mkdir -p "$HOME/codeeditor-data/workspaces" "$HOME/codeeditor-data/secrets"
+
 docker build -t codeeditor-bridge-daemon .
 docker run --rm -p 8443:8443 \
   -v "$(pwd)/dev.crt:/etc/bridged/tls.crt:ro" \
   -v "$(pwd)/dev.key:/etc/bridged/tls.key:ro" \
-  -v codeeditor-workspaces:/var/lib/codeeditor/workspaces \
-  -v codeeditor-secrets:/var/lib/codeeditor/secrets \
+  -v "$HOME/codeeditor-data/workspaces:$HOME/codeeditor-data/workspaces" \
+  -v "$HOME/codeeditor-data/secrets:$HOME/codeeditor-data/secrets" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  codeeditor-bridge-daemon
+  codeeditor-bridge-daemon \
+  --workspace-dir "$HOME/codeeditor-data/workspaces" \
+  --secrets-dir "$HOME/codeeditor-data/secrets"
 ```
 
-The two named volumes (`codeeditor-workspaces`, `codeeditor-secrets`) are optional but recommended — without them, cloned Workspaces and generated git credentials are lost every time the container is recreated.
+`$HOME/codeeditor-data/{workspaces,secrets}` are bind-mounted from the **real host**, at that same identical path — not named volumes, and this matters beyond just surviving a container recreate: `devpod up` (invoked from inside this container, against the real Docker host via the mounted socket) asks that real host to bind-mount a Workspace's path into the sibling container it creates. A named volume's real path (`/var/lib/docker/volumes/<name>/_data`) isn't the path `devpod` asks for, so `devpod up` fails with `bind source path does not exist: <path>/<id>` — confirmed by hand against a real `devpod up`, not just reasoned through. Same identical path on both sides (host and container) is what makes the bind-mount source real from dockerd's point of view.
+
+`$HOME` (rather than the `--workspace-dir`/`--secrets-dir` defaults, `/var/lib/codeeditor/{workspaces,secrets}` — still the right default for a real self-hosted machine, see "Self-hosted" above) is what lets the `mkdir` above skip `sudo` for local iteration on your own Mac — but it's not an arbitrary sudo-free path either. On Colima specifically (`docker context ls` shows which backend a given machine is on), the VM's virtiofs mount only maps UID/GID correctly under the real `$HOME`; a path like `/Users/Shared`, while world-writable on macOS itself, mounts into the Colima VM owned `root:root` and unwritable by any other UID — confirmed by hand, cost a failed provisioning run to find.
 
 The `Dockerfile` is the daemon's own image (Go binary + `tmux`/`git`/`ssh`/the `devpod` CLI/the `docker` CLI) — it is **not** where each project's Workspace lives. Those are created on demand by `devpod up` from each repository's own `devcontainer.json` (detected or generated, `internal/gitmanager`) — there is no, and shouldn't be, a fixed "CodeEditor workspace" image in any registry; that's exactly what using DevPod instead of maintaining per-language images solves. The host's Docker socket is mounted (not Docker-in-Docker) so `devpod` creates those Workspaces as sibling containers, not children, of the daemon's own container.
 
-**Verified end to end in self-hosted mode** (outside the container, same binary): `/handshake` responds with the machine's real checklist; `POST /git-credentials/ssh-key/generate` generates and stores a real ed25519 key; `POST /projects/provision` actually clones a real public repository, detects/generates its `devcontainer.json`, and reaches the `devpod-up` step — which only fails because `devpod` wasn't installed on the machine this particular check was run on (it is in the Docker image, so that step runs for real there too).
+**Verified end to end in self-hosted mode** (outside the container, same binary): `/handshake` responds with the machine's real checklist; `POST /git-credentials/ssh-key/generate` generates and stores a real ed25519 key; `POST /projects/provision` actually clones a real public repository, detects/generates its `devcontainer.json`, brings up a real Workspace, installs its Language Server(s), and installs the Claude Code CLI — `Result.Status` reaches `"ready"` for real, every step `"done"`. Real, confirmed bugs found and fixed getting there:
+
+- `SubprocessRunner` invoked `devpod up --output json`, a flag that doesn't exist (`--log-output json` is the real one — every single call failed immediately with `unknown flag: --output`).
+- A fresh `devpod` install has no provider configured at all (`Up` now runs `devpod provider add/use docker` itself, once, before the first real `up`).
+- The bind-mount path-parity issue above (Docker-outside-of-Docker).
+- `gitmanager.Cloner.Clone` discarded git's own stderr on failure, returning a bare `exit status 128` — now surfaces git's actual last stderr line (e.g. `fatal: repository ... not found`).
+- `gitmanager.DetectOrGenerate` computed a devcontainer config but never wrote it to `.devcontainer/devcontainer.json` — `devpod up` only ever reads that file off disk, so it silently ignored the detection and ran its own (cruder, sometimes wrong) auto-detection instead. Now writes the generated file when none exists on disk already.
+- `bootstrap.SubprocessExecutor` (LSP install, Claude Code install) ran `npm`/`curl` directly on the Bridge Daemon's own host — which not only lacks those toolchains but wouldn't install into the right container even if it did. `devpod.SSHExecutor` now runs them via `devpod ssh <workspaceID> --command ...`, the same pattern `Up` already used for `devpod up` itself.
+
+`internal/devpod.ProvisioningStep.Error` carries the actual failure message for whichever step still fails (devpod's own `{"level":"fatal","message":...}` line when there is one, falling back to stderr) — a failed step used to be a bare red X with nothing to explain it.
 
 **The `Dockerfile` itself is also verified** with a real `docker build`/`docker run` (not just reasoned through) — `/handshake` responded `bridge-daemon-reachable: verified` from the built image. One real fix that came out of it: bind-mounting a single file to a path whose parent directory doesn't exist yet in the image can make Docker create a *directory* there instead (hit this on Docker Desktop for Mac) — `/etc/bridged` is now pre-created in the image to avoid it.
 
-**Real gap still open**: `internal/ws/lsp_proxy.go`, `internal/debug` (DAP adapters), `internal/devpod` (Run execution), and `internal/bootstrap.Executor` all invoke their subprocesses (`pyright-langserver`, `debugpy`, the Run command, `pip`/`npm`/etc.) directly on the Bridge Daemon's own host/container — not inside the Workspace container via `devpod ssh`. This doesn't show with a single active test Workspace (everything runs against the same cloned filesystem), but it's wrong for several concurrent Workspaces, the real production case. Closing this is a bigger change (routing every subprocess through `devpod ssh <workspace> -- <command>`) that wasn't in scope for this pass.
+**Real gap still open**: `internal/ws/lsp_proxy.go` (the live Language Server process, once `bootstrap.Executor` above has installed it), `internal/debug` (DAP adapters), and `internal/devpod` (Run execution) all still invoke their subprocesses (`pyright-langserver`, `debugpy`, the Run command) directly on the Bridge Daemon's own host/container — not inside the Workspace container via `devpod ssh`. `internal/bootstrap.Executor` no longer has this problem (see `devpod.SSHExecutor` above) — what's left is routing a *live, long-running* process's stdio through a `devpod ssh` tunnel instead of a run-to-completion install command, a materially bigger change than SSHExecutor's one-shot `--command` calls (`LSP`/debug need an interactively piped subprocess, not one `exec.Command().Run()`). This doesn't show with a single active test Workspace (everything runs against the same cloned filesystem), but it's wrong for several concurrent Workspaces, the real production case.
 
 **Managed tier (AWS)**: the custom CDK stack (`backend/amplify/cdk/bridge-daemon-infra.ts`, in the coordinator's `backend/` submodule) today only provisions the shared VPC and ECS cluster — the daemon's own Service/task definition and pushing this image to ECR aren't implemented. Neither was in scope for `specs/001-core-development-flows/tasks.md`. For a managed deployment, `LocalFileStore`/`entitlements.NewGate(nil)` in `main.go` would also need to be swapped for `SecretsManagerStore`/a real `entitlements.DynamoDBStore` — the seam already exists (`gitmanager.SecretStore`, `entitlements.Store` are interfaces), only the real-AWS-client construction in `main.go` is missing.

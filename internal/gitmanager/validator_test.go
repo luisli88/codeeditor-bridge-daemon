@@ -1,11 +1,18 @@
 package gitmanager
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func TestPatValidationRequest_KnownProviders(t *testing.T) {
@@ -84,18 +91,147 @@ func TestProviderValidator_ValidateGitHubOAuthDerived_UsesPATPath(t *testing.T) 
 	}
 }
 
-// Documents the validator's own known limitation (see the comment on
-// validateSSHReachability): `ssh` exits non-zero even for a DNS
-// resolution failure, and any *exec.ExitError reads as "the host
-// responded" — so this genuinely returns no error here, not because the
-// host is reachable, but because the heuristic can't tell the difference.
-func TestProviderValidator_ValidateSSHReachability_UnresolvableHost_TreatedAsReachable(t *testing.T) {
+func TestProviderValidator_ValidateSSHKey_UnresolvableHost_Fails(t *testing.T) {
 	validator := NewProviderValidator()
-	err := validator.Validate(context.Background(), "this-host-does-not-exist.invalid", CredentialKindSSHKey, "")
+	err := validator.Validate(
+		context.Background(), "this-host-does-not-exist.invalid", CredentialKindSSHKey, testSSHPrivateKeyPEM(t),
+	)
+
+	if err == nil {
+		t.Fatal("expected an error for an unresolvable host")
+	}
+}
+
+func TestProviderValidator_ValidateSSHKey_MalformedKey_Fails(t *testing.T) {
+	validator := NewProviderValidator()
+	err := validator.Validate(context.Background(), "github.com", CredentialKindSSHKey, "not a real key")
+
+	if err == nil {
+		t.Fatal("expected an error for a malformed private key")
+	}
+}
+
+// The provider's SSH server always completes the transport handshake
+// regardless of which key (if any) is offered — a bare reachability check
+// passes for *any* key against *any* running SSH server, which is exactly
+// the bug this test guards against: only a key the fake server's
+// PublicKeyCallback actually authorizes should validate successfully.
+func TestProviderValidator_ValidateSSHKey_AuthorizedKey_Succeeds(t *testing.T) {
+	authorizedSigner, authorizedPEM := testGenerateSSHKeyPair(t)
+	addr := startFakeSSHServer(t, authorizedSigner.PublicKey())
+
+	validator := NewProviderValidator()
+	validator.SSHPort = portOf(t, addr)
+	err := validator.Validate(context.Background(), hostOf(t, addr), CredentialKindSSHKey, authorizedPEM)
 
 	if err != nil {
-		t.Fatalf("expected no error (known heuristic limitation), got %v", err)
+		t.Fatalf("expected the authorized key to validate, got %v", err)
 	}
+}
+
+func TestProviderValidator_ValidateSSHKey_UnauthorizedKey_Fails(t *testing.T) {
+	authorizedSigner, _ := testGenerateSSHKeyPair(t)
+	_, unauthorizedPEM := testGenerateSSHKeyPair(t)
+	addr := startFakeSSHServer(t, authorizedSigner.PublicKey())
+
+	validator := NewProviderValidator()
+	validator.SSHPort = portOf(t, addr)
+	err := validator.Validate(context.Background(), hostOf(t, addr), CredentialKindSSHKey, unauthorizedPEM)
+
+	if err == nil {
+		t.Fatal("expected an error for a key the fake provider never authorized")
+	}
+}
+
+// startFakeSSHServer stands in for a real git provider's SSH endpoint —
+// it accepts a connection only from authorizedKey (mirroring "this key is
+// registered on the account"), rejecting every other key, and never
+// offers any channel (real providers don't give git@ connections a shell
+// either).
+func startFakeSSHServer(t *testing.T, authorizedKey ssh.PublicKey) string {
+	t.Helper()
+
+	hostSigner, _ := testGenerateSSHKeyPair(t)
+	config := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), authorizedKey.Marshal()) {
+				return nil, nil
+			}
+			return nil, errUnauthorizedTestKey
+		},
+	}
+	config.AddHostKey(hostSigner)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				sshConn, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return // auth rejected — the client sees that as the Dial error
+				}
+				defer sshConn.Close() //nolint:errcheck
+				go ssh.DiscardRequests(reqs)
+				for newChannel := range chans {
+					_ = newChannel.Reject(ssh.Prohibited, "no channels in this fake")
+				}
+			}()
+		}
+	}()
+
+	return listener.Addr().String()
+}
+
+var errUnauthorizedTestKey = errors.New("unauthorized key")
+
+func testGenerateSSHKeyPair(t *testing.T) (signer ssh.Signer, privateKeyPEM string) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 key: %v", err)
+	}
+	signer, err = ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("signer from key: %v", err)
+	}
+	pemBytes, err := marshalPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	return signer, pemBytes
+}
+
+func testSSHPrivateKeyPEM(t *testing.T) string {
+	t.Helper()
+	_, pem := testGenerateSSHKeyPair(t)
+	return pem
+}
+
+func portOf(t *testing.T, addr string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split host port %q: %v", addr, err)
+	}
+	return port
+}
+
+func hostOf(t *testing.T, addr string) string {
+	t.Helper()
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split host port %q: %v", addr, err)
+	}
+	return host
 }
 
 func TestProviderValidator_Validate_UnknownKind_ReturnsError(t *testing.T) {

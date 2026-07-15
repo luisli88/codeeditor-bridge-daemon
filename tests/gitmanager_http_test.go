@@ -236,6 +236,64 @@ func TestReauthenticateHandler_StillInvalid_ReturnsUnprocessableEntity(t *testin
 	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
 }
 
+// The second step of the generate-then-verify flow: GenerateSSHKey never
+// validates (there's nothing to check yet), so the credential comes back
+// `unverified` — Verify is what the Desarrollador triggers after actually
+// adding the public key to their provider.
+func TestVerifyHandler_Succeeds_MarksVerified(t *testing.T) {
+	mux, _ := newTestMux()
+
+	generateRec := postJSON(t, mux, "/git-credentials/ssh-key/generate", map[string]string{
+		"ownerUserId": "user-1", "alias": "My Key", "domain": "github.com",
+	})
+	var generateResp struct {
+		Credential gitmanager.Credential `json:"credential"`
+	}
+	require.NoError(t, json.Unmarshal(generateRec.Body.Bytes(), &generateResp))
+	require.Equal(t, gitmanager.CredentialStatusUnverified, generateResp.Credential.Status)
+
+	rec := postJSON(t, mux, "/git-credentials/verify", map[string]any{
+		"credential": generateResp.Credential,
+	})
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Credential gitmanager.Credential `json:"credential"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, gitmanager.CredentialStatusVerified, resp.Credential.Status)
+}
+
+func TestVerifyHandler_StillRejected_ReturnsUnprocessableEntity(t *testing.T) {
+	store := newFakeSecretStore()
+	ref := "codeeditor/git-credentials/user-1/cred-1"
+	store.values[ref] = "some-private-key-pem"
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: true})
+	mux := http.NewServeMux()
+	gitmanager.RegisterRoutes(mux, manager)
+
+	rec := postJSON(t, mux, "/git-credentials/verify", map[string]any{
+		"credential": gitmanager.Credential{
+			ID: "cred-1", OwnerUserID: "user-1", Alias: "My Key", Domain: "github.com",
+			Kind: gitmanager.CredentialKindSSHKey, Status: gitmanager.CredentialStatusUnverified, SecretRef: ref,
+		},
+	})
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestVerifyHandler_InvalidBody_ReturnsBadRequest(t *testing.T) {
+	mux, _ := newTestMux()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(), http.MethodPost, "/git-credentials/verify", strings.NewReader("not json"),
+	)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
 func TestReauthenticateHandler_InvalidBody_ReturnsBadRequest(t *testing.T) {
 	mux, _ := newTestMux()
 

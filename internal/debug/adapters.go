@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/devpodexec"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/ws"
 )
 
@@ -74,17 +75,14 @@ type adapterServer struct {
 	mu     sync.Mutex
 }
 
-func startAdapterServer(ctx context.Context, name string, args []string) (*adapterServer, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	stdin, err := cmd.StdinPipe()
+// startAdapterServer runs name+args inside workspaceID's devpod Workspace
+// (devpodexec.StartPiped) rather than on the Bridge Daemon's own host —
+// the debug adapter needs the Workspace's own toolchain/interpreter
+// (debugpy needs the Workspace's Python, dlv needs the Workspace's Go
+// build, ...), which only exists inside that container.
+func startAdapterServer(ctx context.Context, workspaceID, name string, args []string) (*adapterServer, error) {
+	cmd, stdin, stdout, err := devpodexec.StartPiped(ctx, workspaceID, name, args...)
 	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	return &adapterServer{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
@@ -185,7 +183,7 @@ func (p *Proxy) serverFor(ctx context.Context, workspaceID string, payload json.
 		// FR-042: explicit, not a silent failure.
 		return nil, false, fmt.Errorf("debug: %s no soporta depuración completa", language)
 	}
-	server, err := startAdapterServer(ctx, name, args)
+	server, err := startAdapterServer(ctx, workspaceID, name, args)
 	if err != nil {
 		return nil, false, fmt.Errorf("debug: iniciar adaptador para %q: %w", language, err)
 	}

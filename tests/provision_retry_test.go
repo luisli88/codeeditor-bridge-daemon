@@ -67,14 +67,14 @@ func newProvisioner(gate *entitlements.Gate, fakes *provisionerFakes) *devpod.Pr
 			}
 			return nil
 		},
-		func(ctx context.Context, languages []string) []bootstrap.LanguageServer {
+		func(ctx context.Context, workspaceID string, languages []string) []bootstrap.LanguageServer {
 			servers := make([]bootstrap.LanguageServer, len(languages))
 			for i, lang := range languages {
 				servers[i] = bootstrap.LanguageServer{Language: lang, Status: bootstrap.LanguageServerStatusReady}
 			}
 			return servers
 		},
-		func(ctx context.Context) error { return nil },
+		func(ctx context.Context, workspaceID string) error { return nil },
 	)
 }
 
@@ -152,4 +152,50 @@ func TestRetryStep_AfterDevPodUpFailure_RetriesOnlyThatStepWithoutRecloning(t *t
 		}
 	}
 	assert.Equal(t, devpod.StepDone, devPodStepStatus)
+}
+
+// A failed step used to leave the Desarrollador with only a red X and no
+// way to tell *why* — Error is what "sale un error, pero no sé cuál" was
+// actually missing.
+func TestProvision_DevPodUpFails_StepErrorHasTheMessage(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{devPodUpShouldFail: true}
+	p := newProvisioner(gate, fakes)
+
+	result := p.Provision(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	})
+
+	var devPodStep devpod.ProvisioningStep
+	for _, step := range result.Steps {
+		if step.Name == devpod.StepDevPodUp {
+			devPodStep = step
+		}
+	}
+	require.NotNil(t, devPodStep.Error)
+	assert.Equal(t, "devpod up failed", *devPodStep.Error)
+}
+
+// A retry that actually succeeds shouldn't leave the previous attempt's
+// error message sitting there next to a green check.
+func TestRetryStep_Succeeds_ClearsThePreviousError(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{devPodUpShouldFail: true}
+	p := newProvisioner(gate, fakes)
+	result := p.Provision(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	})
+
+	fakes.devPodUpShouldFail = false
+	p.RetryStep(context.Background(), devpod.Request{
+		WorkspaceID: "ws-1", OwnerUserID: "user-1", HostKind: "managed", RepositoryURL: "https://github.com/x/y.git",
+	}, result, devpod.StepDevPodUp)
+
+	var devPodStep devpod.ProvisioningStep
+	for _, step := range result.Steps {
+		if step.Name == devpod.StepDevPodUp {
+			devPodStep = step
+		}
+	}
+	assert.Nil(t, devPodStep.Error)
 }

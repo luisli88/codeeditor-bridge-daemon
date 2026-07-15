@@ -2,28 +2,39 @@ package gitmanager
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net"
 	"net/http"
-	"os/exec"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // ProviderValidator validates PAT credentials against known provider API
-// patterns (FR-016), and does a best-effort SSH reachability check for
-// llave SSH credentials — a full auth-success signal from `ssh -T` is
-// provider-specific (GitHub/GitLab return exit code 1 even on a
-// *successful* authenticated handshake, by their own design) and out of
-// scope to disambiguate perfectly here; a successful TCP+SSH handshake to
-// the domain is treated as verified.
+// patterns (FR-016), and a llave SSH by actually authenticating with it
+// against the domain's SSH server as the `git` user — the same identity
+// `git@github.com` clone/push URLs use, and the only one GitHub (and
+// GitLab/Bitbucket) accept public-key auth for. A successful
+// `ssh.Dial`/handshake means the provider accepted *this* key, not just
+// that the host has an SSH server running.
 type ProviderValidator struct {
 	HTTPClient *http.Client
+	// SSHPort overrides the default 22 — only ever set by tests, against a
+	// local fake SSH server instead of a real provider.
+	SSHPort string
 }
 
 // NewProviderValidator builds a ProviderValidator with a sane default
 // timeout.
 func NewProviderValidator() *ProviderValidator {
 	return &ProviderValidator{HTTPClient: &http.Client{Timeout: 10 * time.Second}}
+}
+
+func (v *ProviderValidator) sshPort() string {
+	if v.SSHPort == "" {
+		return "22"
+	}
+	return v.SSHPort
 }
 
 func (v *ProviderValidator) Validate(ctx context.Context, domain string, kind CredentialKind, secret string) error {
@@ -34,7 +45,7 @@ func (v *ProviderValidator) Validate(ctx context.Context, domain string, kind Cr
 		// so the derived credential validates via the same path.
 		return v.validatePAT(ctx, domain, secret)
 	case CredentialKindSSHKey:
-		return v.validateSSHReachability(ctx, domain)
+		return v.validateSSHKey(domain, secret)
 	default:
 		return fmt.Errorf("gitmanager: unknown credential kind %q", kind)
 	}
@@ -78,23 +89,34 @@ func patValidationRequest(domain, token string) (url string, authHeader string) 
 	}
 }
 
-func (v *ProviderValidator) validateSSHReachability(ctx context.Context, domain string) error {
-	cmd := exec.CommandContext(
-		ctx, "ssh",
-		"-T", "git@"+domain,
-		"-o", "BatchMode=yes",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "ConnectTimeout=5",
-	)
-	// El código de salida de `ssh -T` no distingue "autenticado" de
-	// "rechazado" en GitHub/GitLab (ambos devuelven distinto de 0 aun con
-	// éxito) — lo único que valida esta llamada es que el host respondió al
-	// handshake SSH, no que la llave específica fue aceptada. Un
-	// *ExitError (el proceso corrió y terminó) cuenta como "el host
-	// respondió"; cualquier otro error (host no resuelve, timeout) no.
-	var exitErr *exec.ExitError
-	if err := cmd.Run(); err != nil && !errors.As(err, &exitErr) {
-		return fmt.Errorf("gitmanager: ssh handshake with %s failed: %w", domain, err)
+// validateSSHKey actually authenticates with privateKeyPEM against
+// domain:22 as the `git` user — completing the SSH handshake *and*
+// public-key auth is only possible if the provider has this exact key on
+// file, unlike a bare TCP/handshake reachability check (which every
+// GitHub/GitLab-style host passes regardless of which key, or whether any
+// key at all, is being offered). Host key verification is intentionally
+// not pinned (same trust-on-first-use trade-off as `SelfSignedTrust.swift`/
+// `RemoteSetupService`'s `.acceptAnything()` on the app side) — there's no
+// prior known-hosts state for a provider the Bridge Daemon has never
+// talked to before, and the thing being verified here is the *client's*
+// key, not the server's identity.
+func (v *ProviderValidator) validateSSHKey(domain, privateKeyPEM string) error {
+	signer, err := ssh.ParsePrivateKey([]byte(privateKeyPEM))
+	if err != nil {
+		return fmt.Errorf("gitmanager: parse SSH private key: %w", err)
 	}
+
+	config := &ssh.ClientConfig{
+		User:            "git",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         10 * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", net.JoinHostPort(domain, v.sshPort()), config)
+	if err != nil {
+		return fmt.Errorf("gitmanager: %s rejected the SSH key: %w", domain, err)
+	}
+	defer client.Close() //nolint:errcheck
 	return nil
 }

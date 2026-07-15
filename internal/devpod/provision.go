@@ -38,10 +38,14 @@ const (
 	StepError   StepStatus = "error"
 )
 
-// ProvisioningStep is one entry of Proyecto.provisioningSteps.
+// ProvisioningStep is one entry of Proyecto.provisioningSteps. Error is
+// only set when Status is StepError — without it, the app had no way to
+// show *why* a step failed, only that it did (a bare red X with nothing
+// else to go on).
 type ProvisioningStep struct {
 	Name   StepName   `json:"name"`
 	Status StepStatus `json:"status"`
+	Error  *string    `json:"error,omitempty"`
 }
 
 // Project status values, mirroring data-model.md → Proyecto.status.
@@ -111,8 +115,14 @@ type (
 	DevcontainerFunc  func(workspacePath string) (map[string]any, error)
 	LanguagesFunc     func(workspacePath string) []string
 	DevPodUpFunc      func(ctx context.Context, workspacePath string) error
-	LSPInstallFunc    func(ctx context.Context, languages []string) []bootstrap.LanguageServer
-	ClaudeInstallFunc func(ctx context.Context) error
+	// LSPInstallFunc takes workspaceID (not workspacePath like the steps
+	// before it) because installing happens *inside* the devpod Workspace
+	// container via `devpod ssh <workspaceID>` — devpod addresses a
+	// Workspace by ID, not by the host-side clone path.
+	LSPInstallFunc func(ctx context.Context, workspaceID string, languages []string) []bootstrap.LanguageServer
+	// ClaudeInstallFunc takes workspaceID for the same reason as
+	// LSPInstallFunc above.
+	ClaudeInstallFunc func(ctx context.Context, workspaceID string) error
 	// ResolveSecretFunc resolves a credential's SecretRef to its actual
 	// secret value (gitmanager.SecretStore.Get) — the app only ever holds
 	// SecretRef (FR-021), never the secret itself, so Provisioner must
@@ -216,16 +226,18 @@ func (p *Provisioner) runStep(ctx context.Context, req Request, result *Result, 
 		err = p.devPodUp(ctx, p.workspacePath(req.WorkspaceID))
 	case StepLSPBootstrap:
 		languages := p.languagesOf(p.workspacePath(req.WorkspaceID))
-		result.LanguageServers = p.installLSP(ctx, languages)
+		result.LanguageServers = p.installLSP(ctx, req.WorkspaceID, languages)
 		err = firstLanguageServerError(result.LanguageServers)
 	case StepClaudeBootstrap:
-		err = p.installClaude(ctx)
+		err = p.installClaude(ctx, req.WorkspaceID)
 	default:
 		err = fmt.Errorf("devpod: unknown step %q", name)
 	}
 
 	if err != nil {
 		result.Steps[idx].Status = StepError
+		message := err.Error()
+		result.Steps[idx].Error = &message
 		if name == StepClone && req.CredentialSecretRef == "" {
 			// FR-023: a clone failure with no credential at all is treated
 			// as "this repo likely needs one" rather than a generic error
@@ -239,6 +251,7 @@ func (p *Provisioner) runStep(ctx context.Context, req Request, result *Result, 
 		return false
 	}
 	result.Steps[idx].Status = StepDone
+	result.Steps[idx].Error = nil
 	if name == StepClaudeBootstrap {
 		result.Status = StatusReady // FR-029: ready only once every step is done
 	}

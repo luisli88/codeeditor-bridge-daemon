@@ -59,6 +59,11 @@ func TestCloner_Clone_InvalidSource_ReportsErrorEvent(t *testing.T) {
 	err := cloner.Clone(context.Background(), "ws-1", filepath.Join(baseDir, "does-not-exist"), nil, reporter)
 
 	require.Error(t, err)
+	// A bare "exit status 128" tells a Desarrollador nothing — git's own
+	// stderr ("repository ... does not exist") is what actually explains
+	// the failure, and must survive into the wrapped error.
+	require.NotContains(t, err.Error(), "exit status 128")
+	require.Contains(t, err.Error(), "does not exist")
 	var sawError bool
 	for _, e := range reporter.events {
 		if e.Phase == "clone" && e.Event == "error" {

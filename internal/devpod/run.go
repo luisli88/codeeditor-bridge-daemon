@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/devpodexec"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/ws"
 )
 
@@ -55,16 +56,15 @@ type runProcess struct {
 // Project's console or web run, streaming stdout/stderr live, and
 // exposing the Workspace's preview URL for web runs.
 type RunManager struct {
-	workspacePath func(workspaceID string) string
-	previewURL    PreviewURLFunc
+	previewURL PreviewURLFunc
 
 	mu      sync.Mutex
 	running map[string]*runProcess // key: workspaceID
 }
 
 // NewRunManager builds a RunManager.
-func NewRunManager(workspacePath func(workspaceID string) string, previewURL PreviewURLFunc) *RunManager {
-	return &RunManager{workspacePath: workspacePath, previewURL: previewURL, running: make(map[string]*runProcess)}
+func NewRunManager(previewURL PreviewURLFunc) *RunManager {
+	return &RunManager{previewURL: previewURL, running: make(map[string]*runProcess)}
 }
 
 // Handler returns the ws.Handler to register for ws.ChannelRun.
@@ -97,23 +97,16 @@ func (m *RunManager) Handler() ws.Handler {
 func (m *RunManager) start(ctx context.Context, conn *ws.Conn, workspaceID string, payload RunPayload) {
 	m.stop(workspaceID) // FR-045: starting again replaces any prior run for this Workspace
 
+	// Runs inside workspaceID's devpod Workspace (devpodexec) rather than
+	// on the Bridge Daemon's own host — the Project's run command needs
+	// the Workspace's own toolchain and dependencies (its node_modules,
+	// its installed interpreter, ...), and devpod's default working
+	// directory inside the container is already the Workspace root, so
+	// there's no separate cwd to set (unlike the direct exec.Command this
+	// replaced, which needed cmd.Dir pointed at the host-side clone path).
 	runCtx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(runCtx, "sh", "-c", payload.Command)
-	cmd.Dir = m.workspacePath(workspaceID)
-
-	stdout, err := cmd.StdoutPipe()
+	cmd, stdout, stderr, err := devpodexec.StartWithOutputPipes(runCtx, workspaceID, "sh", "-c", payload.Command)
 	if err != nil {
-		cancel()
-		conn.SendError(ws.Envelope{Channel: ws.ChannelRun, WorkspaceID: &workspaceID}, "run-start-failed", err.Error(), nil)
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		conn.SendError(ws.Envelope{Channel: ws.ChannelRun, WorkspaceID: &workspaceID}, "run-start-failed", err.Error(), nil)
-		return
-	}
-	if err := cmd.Start(); err != nil {
 		cancel()
 		conn.SendError(ws.Envelope{Channel: ws.ChannelRun, WorkspaceID: &workspaceID}, "run-start-failed", err.Error(), nil)
 		return
@@ -141,11 +134,20 @@ func (m *RunManager) start(ctx context.Context, conn *ws.Conn, workspaceID strin
 func (m *RunManager) pump(ctx context.Context, conn *ws.Conn, workspaceID string, pipe io.Reader, isStderr bool) {
 	scanner := bufio.NewScanner(pipe)
 	for scanner.Scan() {
+		line := scanner.Text()
+		// devpodexec routes this command through `devpod ssh`, which
+		// prints its own tunnel-teardown diagnostic on stderr every time,
+		// success or not — without this, every single run's output ended
+		// with a confusing devpod-internal line that has nothing to do
+		// with the Project's own program.
+		if isStderr && devpodexec.IsOwnDiagnosticNoise(line) {
+			continue
+		}
 		payload := RunPayload{Action: "start"}
 		if isStderr {
-			payload.Stderr = scanner.Text()
+			payload.Stderr = line
 		} else {
-			payload.Stdout = scanner.Text()
+			payload.Stdout = line
 		}
 		_ = conn.SendPayload(ctx, uuid.NewString(), ws.ChannelRun, &workspaceID, payload)
 	}

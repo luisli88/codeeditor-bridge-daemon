@@ -84,7 +84,13 @@ func (m *CredentialManager) secretRef(ownerUserID, credentialID string) string {
 
 // GenerateSSHKey creates a new ed25519 key pair, stores the private key,
 // and returns the Credential plus the public key the Desarrollador needs
-// to add to their git provider.
+// to add to their git provider. Unlike RegisterPAT/ImportSSHKey, this one
+// can never validate *before* storing — the provider can't possibly
+// accept a key it hasn't been given yet — so it always persists and
+// starts `unverified`, deliberately *not* attempting validation yet
+// either (that would just fail every time, since the Desarrollador hasn't
+// had a chance to add the public half anywhere). `Verify` is the explicit
+// second step, called once they have.
 func (m *CredentialManager) GenerateSSHKey(
 	ctx context.Context,
 	ownerUserID, alias, domain string,
@@ -102,7 +108,7 @@ func (m *CredentialManager) GenerateSSHKey(
 		return Credential{}, "", err
 	}
 
-	cred, err := m.store(ctx, ownerUserID, alias, domain, CredentialKindSSHKey, privatePEM)
+	cred, err := m.storeGenerated(ctx, ownerUserID, alias, domain, privatePEM)
 	if err != nil {
 		return Credential{}, "", err
 	}
@@ -147,27 +153,70 @@ func (m *CredentialManager) store(
 	kind CredentialKind,
 	secret string,
 ) (Credential, error) {
+	// FR-016: validate against the provider *before* persisting anything —
+	// a credential that doesn't actually work is never stored (no secret
+	// written, no Credential returned) instead of sitting around
+	// "unverified" and colliding with a retry that reuses the same alias.
+	if err := m.validator.Validate(ctx, domain, kind, secret); err != nil {
+		return Credential{}, fmt.Errorf("gitmanager: credential validation failed: %w", err)
+	}
+
 	id := uuid.NewString()
 	ref := m.secretRef(ownerUserID, id)
 	if err := m.secrets.Put(ctx, ref, secret); err != nil {
 		return Credential{}, fmt.Errorf("gitmanager: store secret: %w", err)
 	}
 
-	cred := Credential{
+	return Credential{
 		ID:          id,
 		OwnerUserID: ownerUserID,
 		Alias:       alias,
 		Domain:      domain,
 		Kind:        kind,
-		Status:      CredentialStatusUnverified,
+		Status:      CredentialStatusVerified,
 		SecretRef:   ref,
+	}, nil
+}
+
+// storeGenerated is GenerateSSHKey's own persistence path — see its doc
+// comment for why it can't gate on (or even attempt) validation the way
+// store does.
+func (m *CredentialManager) storeGenerated(
+	ctx context.Context,
+	ownerUserID, alias, domain, secret string,
+) (Credential, error) {
+	id := uuid.NewString()
+	ref := m.secretRef(ownerUserID, id)
+	if err := m.secrets.Put(ctx, ref, secret); err != nil {
+		return Credential{}, fmt.Errorf("gitmanager: store secret: %w", err)
 	}
 
-	// FR-016: validar contra el dominio/proveedor antes de marcar verified.
-	if err := m.validator.Validate(ctx, domain, kind, secret); err == nil {
-		cred.Status = CredentialStatusVerified
+	return Credential{
+		ID:          id,
+		OwnerUserID: ownerUserID,
+		Alias:       alias,
+		Domain:      domain,
+		Kind:        CredentialKindSSHKey,
+		Status:      CredentialStatusUnverified,
+		SecretRef:   ref,
+	}, nil
+}
+
+// Verify re-checks an already-stored credential's existing secret against
+// the provider — the explicit second step after GenerateSSHKey, once the
+// Desarrollador has actually added the public key to their provider.
+// Unlike Reauthenticate, no new secret comes from the caller: the same
+// one that's already stored is re-read and re-validated.
+func (m *CredentialManager) Verify(ctx context.Context, cred *Credential) error {
+	secret, err := m.secrets.Get(ctx, cred.SecretRef)
+	if err != nil {
+		return fmt.Errorf("gitmanager: read secret: %w", err)
 	}
-	return cred, nil
+	if err := m.validator.Validate(ctx, cred.Domain, cred.Kind, secret); err != nil {
+		return fmt.Errorf("gitmanager: verification failed: %w", err)
+	}
+	cred.Status = CredentialStatusVerified
+	return nil
 }
 
 // Revoke marks a credential invalid because the provider revoked it

@@ -12,6 +12,8 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/devpodexec"
 )
 
 // LSPCommand resolves the subprocess command+args that start languageID's
@@ -32,17 +34,14 @@ type lspServer struct {
 	mu     sync.Mutex // guards concurrent writes to stdin
 }
 
-func startLSPServer(ctx context.Context, name string, args []string) (*lspServer, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	stdin, err := cmd.StdinPipe()
+// startLSPServer runs name+args inside workspaceID's devpod Workspace
+// (devpodexec.StartPiped) rather than on the Bridge Daemon's own host —
+// the Language Server needs the Workspace's own toolchain (its installed
+// node_modules, its Python venv, ...), which only exists inside that
+// container, not wherever the daemon itself happens to be running.
+func startLSPServer(ctx context.Context, workspaceID, name string, args []string) (*lspServer, error) {
+	cmd, stdin, stdout, err := devpodexec.StartPiped(ctx, workspaceID, name, args...)
 	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	return &lspServer{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
@@ -108,8 +107,11 @@ type LSPProxy struct {
 // already present — called before the very first spawn for a
 // (workspaceID, languageID) pair, whether that's the up-front install
 // from provisioning (FR-027, already done by then, so this is a no-op in
-// practice) or a language nobody detected up front (FR-036).
-type EnsureInstalledFunc func(ctx context.Context, languageID string) error
+// practice) or a language nobody detected up front (FR-036). Takes
+// workspaceID because — same as startLSPServer — installing has to
+// happen inside that specific Workspace container, not on the Bridge
+// Daemon's own host.
+type EnsureInstalledFunc func(ctx context.Context, workspaceID, languageID string) error
 
 // NewLSPProxy builds an LSPProxy that starts servers via command, first
 // making sure each one is installed via ensureInstalled.
@@ -174,14 +176,14 @@ func (p *LSPProxy) serverFor(ctx context.Context, workspaceID, languageID string
 	if server, ok := p.servers[key]; ok {
 		return server, false, nil
 	}
-	if err := p.ensureInstalled(ctx, languageID); err != nil {
+	if err := p.ensureInstalled(ctx, workspaceID, languageID); err != nil {
 		return nil, false, fmt.Errorf("ws: install language server for %q: %w", languageID, err)
 	}
 	name, args, err := p.command(languageID)
 	if err != nil {
 		return nil, false, fmt.Errorf("ws: resolve language server for %q: %w", languageID, err)
 	}
-	server, err := startLSPServer(ctx, name, args)
+	server, err := startLSPServer(ctx, workspaceID, name, args)
 	if err != nil {
 		return nil, false, fmt.Errorf("ws: start language server for %q: %w", languageID, err)
 	}

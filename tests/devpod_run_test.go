@@ -36,7 +36,8 @@ func dialRunChannel(t *testing.T, manager *devpod.RunManager) (*websocket.Conn, 
 
 // FR-039: stdout streams live for a console run.
 func TestRunManager_StartConsole_StreamsStdout(t *testing.T) {
-	manager := devpod.NewRunManager(func(workspaceID string) string { return "." }, nil)
+	fakeDevpodSSHScript(t)
+	manager := devpod.NewRunManager(nil)
 	c, cleanup := dialRunChannel(t, manager)
 	defer cleanup()
 
@@ -57,10 +58,37 @@ func TestRunManager_StartConsole_StreamsStdout(t *testing.T) {
 	require.Equal(t, "hello", runPayload.Stdout)
 }
 
+// A real `devpod ssh` prints its own tunnel-teardown diagnostic to
+// stderr on every invocation, success or not — it must never reach the
+// Desarrollador as if it were their own program's stderr output.
+func TestRunManager_StartConsole_FiltersDevpodOwnDiagnosticNoise(t *testing.T) {
+	fakeDevpodSSHScriptWithDevpodNoise(t)
+	manager := devpod.NewRunManager(nil)
+	c, cleanup := dialRunChannel(t, manager)
+	defer cleanup()
+
+	payload, err := json.Marshal(devpod.RunPayload{
+		Action: "start", Kind: devpod.RunKindConsole, Command: "echo real-stderr-line 1>&2",
+	})
+	require.NoError(t, err)
+	workspaceID := "ws-1"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{ID: "req-1", Channel: ws.ChannelRun, WorkspaceID: &workspaceID, Payload: payload}))
+
+	var resp ws.Envelope
+	require.NoError(t, wsjson.Read(ctx, c, &resp))
+	require.Nil(t, resp.Error)
+	var runPayload devpod.RunPayload
+	require.NoError(t, json.Unmarshal(resp.Payload, &runPayload))
+	require.Equal(t, "real-stderr-line", runPayload.Stderr,
+		"devpod's own tunnel-teardown noise must be filtered out, only the program's real stderr should reach the client")
+}
+
 // FR-040: a web run reports a preview URL.
 func TestRunManager_StartWeb_ReportsPreviewURL(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	manager := devpod.NewRunManager(
-		func(workspaceID string) string { return "." },
 		func(workspaceID string) string { return "https://" + workspaceID + ".preview.codeeditor.dev" },
 	)
 	c, cleanup := dialRunChannel(t, manager)
@@ -82,7 +110,8 @@ func TestRunManager_StartWeb_ReportsPreviewURL(t *testing.T) {
 
 // FR-045: stop terminates the run.
 func TestRunManager_Stop_AcknowledgesStop(t *testing.T) {
-	manager := devpod.NewRunManager(func(workspaceID string) string { return "." }, nil)
+	fakeDevpodSSHScript(t)
+	manager := devpod.NewRunManager(nil)
 	c, cleanup := dialRunChannel(t, manager)
 	defer cleanup()
 

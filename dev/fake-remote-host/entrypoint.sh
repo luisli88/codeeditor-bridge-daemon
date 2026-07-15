@@ -16,4 +16,16 @@ if [ -S /var/run/docker.sock ]; then
     fi
 fi
 
+# CODEEDITOR_DATA_DIR (set via docker-compose's `environment:`) is the
+# real host's bind-mount path — the SAME literal string on both sides is
+# what makes `devpod up` (invoked over the SSH session below) resolve a
+# real path on the actual Docker host, see docker-compose.yml. A bare
+# `$HOME` inside that SSH session would resolve to `developer`'s own
+# /home/developer, not this value, silently breaking that path parity
+# again — /etc/environment is read by PAM for every login session
+# (interactive SSH included), so it's how the value crosses that boundary.
+if [ -n "$CODEEDITOR_DATA_DIR" ]; then
+    echo "CODEEDITOR_DATA_DIR=$CODEEDITOR_DATA_DIR" >> /etc/environment
+fi
+
 exec /usr/sbin/sshd -D -e

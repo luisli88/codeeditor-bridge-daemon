@@ -16,6 +16,7 @@ func RegisterRoutes(mux *http.ServeMux, manager *CredentialManager) {
 	mux.HandleFunc("POST /git-credentials/pat", registerPATHandler(manager))
 	mux.HandleFunc("POST /git-credentials/github-derived", registerGitHubDerivedHandler(manager))
 	mux.HandleFunc("POST /git-credentials/reauthenticate", reauthenticateHandler(manager))
+	mux.HandleFunc("POST /git-credentials/verify", verifyHandler(manager))
 }
 
 type credentialResponse struct {
@@ -111,6 +112,23 @@ func reauthenticateHandler(manager *CredentialManager) http.HandlerFunc {
 		}
 		cred := req.Credential
 		if err := manager.Reauthenticate(r.Context(), &cred, req.NewSecret); err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, credentialResponse{Credential: cred})
+	}
+}
+
+func verifyHandler(manager *CredentialManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Credential Credential `json:"credential"`
+		}
+		if !decodeRequest(w, r, &req) {
+			return
+		}
+		cred := req.Credential
+		if err := manager.Verify(r.Context(), &cred); err != nil {
 			writeError(w, err)
 			return
 		}

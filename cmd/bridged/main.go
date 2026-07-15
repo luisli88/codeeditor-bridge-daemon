@@ -70,7 +70,6 @@ func wireGitCredentials(mux *http.ServeMux, store gitmanager.SecretStore) {
 // entitlements.DynamoDBStore here instead.
 func wireProvisioning(mux *http.ServeMux, cloner *gitmanager.Cloner, secretStore gitmanager.SecretStore) {
 	gate := entitlements.NewGate(nil)
-	lspBootstrapper := bootstrap.NewLSPBootstrapper(bootstrap.SubprocessExecutor{})
 
 	provisioner := devpod.NewProvisioner(
 		gate,
@@ -80,7 +79,7 @@ func wireProvisioning(mux *http.ServeMux, cloner *gitmanager.Cloner, secretStore
 		devcontainerFunc,
 		gitmanager.DetectLanguages,
 		devPodUpFunc,
-		lspInstallFunc(lspBootstrapper),
+		lspInstallFunc,
 		claudeInstallFunc,
 	)
 	devpod.RegisterRoutes(mux, provisioner)
@@ -107,7 +106,7 @@ func wireChannels(cloner *gitmanager.Cloner, secretStore gitmanager.SecretStore)
 	shellSessions.SetOutputWatcher(session.NewAuthDetector().Watch())
 	server.Handle(ws.ChannelShell, shellSessions.Handler())
 
-	runManager := devpod.NewRunManager(cloner.WorkspacePath, previewURLFunc)
+	runManager := devpod.NewRunManager(previewURLFunc)
 	server.Handle(ws.ChannelRun, runManager.Handler())
 
 	operations := gitmanager.NewOperations(cloner.WorkspacePath)
@@ -147,15 +146,24 @@ func devPodUpFunc(ctx context.Context, workspacePath string) error {
 	return devpod.SubprocessRunner{}.Up(ctx, workspacePath, func(line string) { log.Printf("devpod up: %s", line) })
 }
 
-func lspInstallFunc(bootstrapper *bootstrap.LSPBootstrapper) devpod.LSPInstallFunc {
-	return func(ctx context.Context, languages []string) []bootstrap.LanguageServer {
-		return bootstrapper.Install(ctx, languages, false)
-	}
+// lspInstallFunc/claudeInstallFunc build a fresh devpod.SSHExecutor per
+// call rather than sharing one — installing has to happen *inside* the
+// just-created Workspace container (`devpod ssh <workspaceID>`), never
+// on the Bridge Daemon's own host, and which Workspace that is isn't
+// known until Provisioner calls in with a specific workspaceID.
+func lspInstallFunc(ctx context.Context, workspaceID string, languages []string) []bootstrap.LanguageServer {
+	bootstrapper := bootstrap.NewLSPBootstrapper(devpod.SSHExecutor{WorkspaceID: workspaceID})
+	return bootstrapper.Install(ctx, languages, false)
 }
 
+// ensureLSPInstalledFunc, like lspInstallFunc above, builds a fresh
+// SSHExecutor per call (targeting whichever Workspace the `lsp` channel
+// call is actually for) rather than once at wiring time — FR-036's
+// on-demand install needs to land inside that specific Workspace
+// container too, not the Bridge Daemon's own host.
 func ensureLSPInstalledFunc() ws.EnsureInstalledFunc {
-	bootstrapper := bootstrap.NewLSPBootstrapper(bootstrap.SubprocessExecutor{})
-	return func(ctx context.Context, languageID string) error {
+	return func(ctx context.Context, workspaceID, languageID string) error {
+		bootstrapper := bootstrap.NewLSPBootstrapper(devpod.SSHExecutor{WorkspaceID: workspaceID})
 		servers := bootstrapper.Install(ctx, []string{languageID}, true)
 		if len(servers) > 0 && servers[0].Status == bootstrap.LanguageServerStatusError {
 			return fmt.Errorf("bridged: install Language Server for %q failed", languageID)
@@ -164,6 +172,6 @@ func ensureLSPInstalledFunc() ws.EnsureInstalledFunc {
 	}
 }
 
-func claudeInstallFunc(ctx context.Context) error {
-	return bootstrap.InstallClaudeCode(ctx, bootstrap.SubprocessExecutor{})
+func claudeInstallFunc(ctx context.Context, workspaceID string) error {
+	return bootstrap.InstallClaudeCode(ctx, devpod.SSHExecutor{WorkspaceID: workspaceID})
 }

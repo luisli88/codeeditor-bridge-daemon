@@ -66,6 +66,7 @@ func sendDebugMessage(t *testing.T, c *websocket.Conn, workspaceID string, msg m
 // supported language, via the same DAP base-protocol framing every real
 // adapter speaks.
 func TestDebugProxy_LaunchAndSetBreakpoints_RoundTripsThroughRealFraming(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	proxy := debug.NewProxy(catAdapterCommand)
 	c, cleanup := dialDebugChannel(t, proxy)
 	defer cleanup()
@@ -109,6 +110,7 @@ func TestDebugProxy_UnsupportedLanguage_ReturnsExplicitError(t *testing.T) {
 
 // FR-043: stopOnEntry only applies to JS/TS, Python, Swift.
 func TestDebugProxy_StopOnEntry_RejectedForUnsupportedLanguage(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	proxy := debug.NewProxy(catAdapterCommand)
 	c, cleanup := dialDebugChannel(t, proxy)
 	defer cleanup()
@@ -129,6 +131,7 @@ func TestDebugProxy_StopOnEntry_RejectedForUnsupportedLanguage(t *testing.T) {
 }
 
 func TestDebugProxy_StopOnEntry_AllowedForSupportedLanguage(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	proxy := debug.NewProxy(catAdapterCommand)
 	c, cleanup := dialDebugChannel(t, proxy)
 	defer cleanup()

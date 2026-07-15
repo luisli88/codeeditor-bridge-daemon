@@ -57,14 +57,18 @@ func TestRegisterPAT_ValidCredential_MarksVerified(t *testing.T) {
 	assert.Equal(t, "ghp_token", storedValue)
 }
 
-func TestRegisterPAT_InvalidCredential_StaysUnverified(t *testing.T) {
+// FR-016: a credential that fails provider validation is never persisted
+// at all — no secret stored, nothing returned — instead of being saved
+// "unverified" and colliding with a retry that reuses the same alias.
+func TestRegisterPAT_InvalidCredential_NotPersisted(t *testing.T) {
 	store := newFakeSecretStore()
 	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: true})
 
 	cred, err := manager.RegisterPAT(context.Background(), "user-1", "Bad Token", "github.com", "bad-token")
 
-	require.NoError(t, err)
-	assert.Equal(t, gitmanager.CredentialStatusUnverified, cred.Status)
+	require.Error(t, err)
+	assert.Empty(t, cred.ID)
+	assert.Empty(t, store.values)
 }
 
 func TestGenerateSSHKey_ReturnsPublicKeyAndStoresPrivateKey(t *testing.T) {

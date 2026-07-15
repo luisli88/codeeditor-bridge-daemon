@@ -25,8 +25,9 @@ func catCommand(languageID string) (string, []string, error) {
 }
 
 func TestLSPProxy_DidOpen_RoutesAndEchoesThroughRealFraming(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	var installedLanguages []string
-	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, languageID string) error {
+	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, workspaceID, languageID string) error {
 		installedLanguages = append(installedLanguages, languageID)
 		return nil
 	})
@@ -64,7 +65,7 @@ func TestLSPProxy_DidOpen_RoutesAndEchoesThroughRealFraming(t *testing.T) {
 }
 
 func TestLSPProxy_NoWorkspaceID_ReturnsError(t *testing.T) {
-	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, languageID string) error { return nil })
+	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, workspaceID, languageID string) error { return nil })
 	srv := ws.NewServer()
 	srv.Handle(ws.ChannelLSP, proxy.Handler())
 	ts := httptest.NewServer(srv)
@@ -89,8 +90,9 @@ func TestLSPProxy_NoWorkspaceID_ReturnsError(t *testing.T) {
 // FR-036: a language nobody detected up front still gets its Language
 // Server installed, on demand, the moment a file of that language opens.
 func TestLSPProxy_UndetectedLanguage_InstallsOnDemand(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	var installedLanguages []string
-	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, languageID string) error {
+	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, workspaceID, languageID string) error {
 		installedLanguages = append(installedLanguages, languageID)
 		return nil
 	})
@@ -125,7 +127,7 @@ func TestLSPProxy_UndetectedLanguage_InstallsOnDemand(t *testing.T) {
 }
 
 func TestLSPProxy_InstallFailure_ReturnsError(t *testing.T) {
-	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, languageID string) error {
+	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, workspaceID, languageID string) error {
 		return errors.New("install failed")
 	})
 	srv := ws.NewServer()
