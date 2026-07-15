@@ -15,6 +15,7 @@ import (
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/debug"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/devpod"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/entitlements"
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/filetree"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/gitmanager"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/session"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/ws"
@@ -88,14 +89,11 @@ func wireProvisioning(mux *http.ServeMux, cloner *gitmanager.Cloner, secretStore
 // wireChannels builds the multiplexed WebSocket server (contracts/
 // websocket-protocol.md) for every channel with a real implementation.
 // Not registered: `claude` (server-initiated pushes only, delivered via
-// the `shell` channel's OutputWatcher below — contracts/auth-flows.md)
-// and `fs` (no implementation exists anywhere in this module yet — file
-// tree sync was never built, see the app-side finding in
-// specs/001-core-development-flows/tasks.md T103). `entitlements` is also
-// not a direct channel here: the only caller of Gate.CheckQuota is
-// Provisioner, reached over the HTTP provisioning routes above, not a raw
-// WS envelope — nothing in the app sends one either
-// (EntitlementsService.swift queries Amplify.API directly).
+// the `shell` channel's OutputWatcher below — contracts/auth-flows.md).
+// `entitlements` is also not a direct channel here: the only caller of
+// Gate.CheckQuota is Provisioner, reached over the HTTP provisioning
+// routes above, not a raw WS envelope — nothing in the app sends one
+// either (EntitlementsService.swift queries Amplify.API directly).
 func wireChannels(cloner *gitmanager.Cloner, secretStore gitmanager.SecretStore) *ws.Server {
 	server := ws.NewServer()
 
@@ -114,6 +112,9 @@ func wireChannels(cloner *gitmanager.Cloner, secretStore gitmanager.SecretStore)
 
 	debugProxy := debug.NewProxy(debug.DefaultAdapterCommand)
 	server.Handle(ws.ChannelDebug, debugProxy.Handler())
+
+	fsBrowser := filetree.NewBrowser(cloner.WorkspacePath)
+	server.Handle(ws.ChannelFS, fsBrowser.Handler())
 
 	return server
 }
