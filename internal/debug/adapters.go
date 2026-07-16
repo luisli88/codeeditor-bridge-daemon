@@ -80,8 +80,18 @@ type adapterServer struct {
 // the debug adapter needs the Workspace's own toolchain/interpreter
 // (debugpy needs the Workspace's Python, dlv needs the Workspace's Go
 // build, ...), which only exists inside that container.
-func startAdapterServer(ctx context.Context, workspaceID, name string, args []string) (*adapterServer, error) {
-	cmd, stdin, stdout, err := devpodexec.StartPiped(ctx, workspaceID, name, args...)
+//
+// Deliberately does *not* take the caller's per-request `ctx` — same
+// reasoning as `ws.startLSPServer`'s identical change: `exec.
+// CommandContext` (inside `devpodexec.StartPiped`) kills the subprocess
+// the moment its context cancels, and reusing a single WebSocket
+// connection's request-scoped `ctx` here meant the debug adapter itself
+// died the moment that connection closed, not just this proxy's own
+// relay getting misdirected (see `Proxy.pump`'s doc comment for that,
+// separate, bug). `internal/devpod/run.go` already gets this right with
+// its own `context.WithCancel(context.Background())`.
+func startAdapterServer(workspaceID, name string, args []string) (*adapterServer, error) {
+	cmd, stdin, stdout, err := devpodexec.StartPiped(context.Background(), workspaceID, name, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +130,15 @@ func (s *adapterServer) readMessage() (json.RawMessage, error) {
 	return buf, nil
 }
 
+// activeConnection is whichever (ctx, conn) pair most recently sent an
+// Envelope for a Workspace's `debug` channel — see `Proxy.pump`'s doc
+// comment for why this needs to be looked up fresh on every relay
+// instead of captured once.
+type activeConnection struct {
+	ctx  context.Context
+	conn *ws.Conn
+}
+
 // Proxy multiplexes the `debug` channel to per-Workspace debug adapter
 // processes — one debug session at a time per Workspace, which is the
 // natural DAP usage pattern (unlike `lsp`, DAP has no standard notion of
@@ -128,13 +147,19 @@ type Proxy struct {
 	command AdapterCommand
 
 	mu         sync.Mutex
-	servers    map[string]*adapterServer // key: workspaceID
-	languageOf map[string]string         // workspaceID -> language, set on first launch/attach
+	servers    map[string]*adapterServer  // key: workspaceID
+	languageOf map[string]string          // workspaceID -> language, set on first launch/attach
+	active     map[string]activeConnection // workspaceID -> most recent (ctx, conn) pair
 }
 
 // NewProxy builds a Proxy that starts adapters via command.
 func NewProxy(command AdapterCommand) *Proxy {
-	return &Proxy{command: command, servers: make(map[string]*adapterServer), languageOf: make(map[string]string)}
+	return &Proxy{
+		command:    command,
+		servers:    make(map[string]*adapterServer),
+		languageOf: make(map[string]string),
+		active:     make(map[string]activeConnection),
+	}
 }
 
 // Handler returns the ws.Handler to register for ws.ChannelDebug.
@@ -146,13 +171,19 @@ func (p *Proxy) Handler() ws.Handler {
 		}
 		workspaceID := *env.WorkspaceID
 
-		server, isNew, err := p.serverFor(ctx, workspaceID, env.Payload)
+		// Recorded on every Envelope, not just the one that spawns a
+		// server — see `pump`'s doc comment.
+		p.mu.Lock()
+		p.active[workspaceID] = activeConnection{ctx: ctx, conn: conn}
+		p.mu.Unlock()
+
+		server, isNew, err := p.serverFor(workspaceID, env.Payload)
 		if err != nil {
 			conn.SendError(env, "debug-launch-failed", err.Error(), nil)
 			return
 		}
 		if isNew {
-			go p.pump(ctx, conn, workspaceID, server)
+			go p.pump(workspaceID, server)
 		}
 
 		if err := p.rejectUnsupportedStopOnEntry(workspaceID, env.Payload); err != nil {
@@ -166,7 +197,7 @@ func (p *Proxy) Handler() ws.Handler {
 	}
 }
 
-func (p *Proxy) serverFor(ctx context.Context, workspaceID string, payload json.RawMessage) (*adapterServer, bool, error) {
+func (p *Proxy) serverFor(workspaceID string, payload json.RawMessage) (*adapterServer, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -183,7 +214,7 @@ func (p *Proxy) serverFor(ctx context.Context, workspaceID string, payload json.
 		// FR-042: explicit, not a silent failure.
 		return nil, false, fmt.Errorf("debug: %s no soporta depuración completa", language)
 	}
-	server, err := startAdapterServer(ctx, workspaceID, name, args)
+	server, err := startAdapterServer(workspaceID, name, args)
 	if err != nil {
 		return nil, false, fmt.Errorf("debug: iniciar adaptador para %q: %w", language, err)
 	}
@@ -219,13 +250,27 @@ func (p *Proxy) rejectUnsupportedStopOnEntry(workspaceID string, payload json.Ra
 	return nil
 }
 
-func (p *Proxy) pump(ctx context.Context, conn *ws.Conn, workspaceID string, server *adapterServer) {
+// pump streams every message the debug adapter writes back to the
+// client, on the same `debug` channel and Workspace, until the process
+// ends. Reads `p.active[workspaceID]` fresh on every message instead of
+// a `conn`/`ctx` captured once at goroutine start — same bug, same fix
+// as `internal/session.ShellSessions.pump` and `LSPProxy.pump` (see
+// either's doc comment for the full story: a stale, closed connection's
+// cancelled `ctx` silently swallowed every relay forever after any
+// reconnect).
+func (p *Proxy) pump(workspaceID string, server *adapterServer) {
 	for {
 		payload, err := server.readMessage()
 		if err != nil {
 			return
 		}
-		_ = conn.SendPayload(ctx, uuid.NewString(), ws.ChannelDebug, &workspaceID, json.RawMessage(payload))
+		p.mu.Lock()
+		active, ok := p.active[workspaceID]
+		p.mu.Unlock()
+		if !ok {
+			continue
+		}
+		_ = active.conn.SendPayload(active.ctx, uuid.NewString(), ws.ChannelDebug, &workspaceID, json.RawMessage(payload))
 	}
 }
 

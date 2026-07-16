@@ -39,8 +39,23 @@ type lspServer struct {
 // the Language Server needs the Workspace's own toolchain (its installed
 // node_modules, its Python venv, ...), which only exists inside that
 // container, not wherever the daemon itself happens to be running.
-func startLSPServer(ctx context.Context, workspaceID, name string, args []string) (*lspServer, error) {
-	cmd, stdin, stdout, err := devpodexec.StartPiped(ctx, workspaceID, name, args...)
+//
+// Deliberately does *not* take the caller's per-request `ctx` —
+// `devpodexec.StartPiped` runs the subprocess via `exec.CommandContext`,
+// which kills it the moment its context is cancelled, and the `ctx`
+// `Handler` hands to `serverFor` is scoped to a single WebSocket
+// connection's lifetime (`Server.ServeHTTP`'s `r.Context()`). A Language
+// Server needs to outlive whichever connection happened to be the one
+// that spawned it (an app relaunch, revisiting a Project, ...) — the
+// same reasoning `internal/devpod/run.go` already gets right with its
+// own `context.WithCancel(context.Background())` instead of reusing the
+// request context. Confirmed live via this file's own reconnect test:
+// without this, the *process itself* died on the first connection's
+// close ("write: broken pipe" on the very next request), which is a
+// deeper problem than `pump`'s stale-connection bug above and would
+// still break a reconnect even with that fixed.
+func startLSPServer(workspaceID, name string, args []string) (*lspServer, error) {
+	cmd, stdin, stdout, err := devpodexec.StartPiped(context.Background(), workspaceID, name, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -94,13 +109,27 @@ func (s *lspServer) readMessage() (json.RawMessage, error) {
 // research.md/the contract don't specify that level of multiplexing, so
 // this is the smallest correct reading of "enruta por workspaceId +
 // languageId" that covers the common case.
+// lspActiveConnection is whichever (ctx, conn) pair most recently sent an
+// Envelope for a Workspace's `lsp` channel — see `LSPProxy.pump`'s doc
+// comment for why this needs to be looked up fresh on every relay
+// instead of captured once. Same shape/reasoning as
+// `internal/session.activeConnection` (that channel's own analogous
+// fix) — not shared as a common type since the two packages don't
+// otherwise depend on each other and this is two fields, not worth a
+// new shared package for.
+type lspActiveConnection struct {
+	ctx  context.Context
+	conn *Conn
+}
+
 type LSPProxy struct {
 	command         LSPCommand
 	ensureInstalled EnsureInstalledFunc
 
 	mu             sync.Mutex
-	servers        map[string]*lspServer // key: workspaceID + "\x00" + languageID
-	activeLanguage map[string]string     // workspaceID -> most recently opened languageID
+	servers        map[string]*lspServer          // key: workspaceID + "\x00" + languageID
+	activeLanguage map[string]string              // workspaceID -> most recently opened languageID
+	active         map[string]lspActiveConnection // workspaceID -> most recent (ctx, conn) pair
 }
 
 // EnsureInstalledFunc installs languageID's Language Server if it isn't
@@ -121,6 +150,7 @@ func NewLSPProxy(command LSPCommand, ensureInstalled EnsureInstalledFunc) *LSPPr
 		ensureInstalled: ensureInstalled,
 		servers:         make(map[string]*lspServer),
 		activeLanguage:  make(map[string]string),
+		active:          make(map[string]lspActiveConnection),
 	}
 }
 
@@ -132,6 +162,12 @@ func (p *LSPProxy) Handler() Handler {
 			return
 		}
 		workspaceID := *env.WorkspaceID
+
+		// Recorded on every Envelope, not just the one that spawns a
+		// server — see `pump`'s doc comment.
+		p.mu.Lock()
+		p.active[workspaceID] = lspActiveConnection{ctx: ctx, conn: conn}
+		p.mu.Unlock()
 
 		languageID, ok := languageIDFromDidOpen(env.Payload)
 		if ok {
@@ -152,7 +188,7 @@ func (p *LSPProxy) Handler() Handler {
 			return
 		}
 		if isNew {
-			go p.pump(ctx, conn, workspaceID, server)
+			go p.pump(workspaceID, server)
 		}
 
 		if err := server.write(env.Payload); err != nil {
@@ -183,7 +219,7 @@ func (p *LSPProxy) serverFor(ctx context.Context, workspaceID, languageID string
 	if err != nil {
 		return nil, false, fmt.Errorf("ws: resolve language server for %q: %w", languageID, err)
 	}
-	server, err := startLSPServer(ctx, workspaceID, name, args)
+	server, err := startLSPServer(workspaceID, name, args)
 	if err != nil {
 		return nil, false, fmt.Errorf("ws: start language server for %q: %w", languageID, err)
 	}
@@ -193,13 +229,33 @@ func (p *LSPProxy) serverFor(ctx context.Context, workspaceID, languageID string
 
 // pump streams every message the Language Server writes back to the
 // client, on the same `lsp` channel and Workspace, until the process ends.
-func (p *LSPProxy) pump(ctx context.Context, conn *Conn, workspaceID string, server *lspServer) {
+//
+// Reads `p.active[workspaceID]` fresh on every message instead of a
+// `conn`/`ctx` captured once at goroutine start — this goroutine is
+// started only the *first* time a (workspaceID, languageID) server is
+// spawned (`isNew` in `Handler`) and then lives for as long as that
+// process does, but the WebSocket connection that happened to trigger
+// that first spawn is under no obligation to live that long too (an app
+// relaunch, a dropped connection, revisiting a Project, ...). Same bug,
+// same fix as `internal/session.ShellSessions.pump` — see that one's
+// doc comment for the full story (found live: Terminal reconnects never
+// received PTY output again; this channel has the identical shape and
+// was never actually exercised long enough in one sitting to notice it
+// independently, but there's no reason to assume it doesn't have the
+// exact same failure mode).
+func (p *LSPProxy) pump(workspaceID string, server *lspServer) {
 	for {
 		payload, err := server.readMessage()
 		if err != nil {
 			return
 		}
-		_ = conn.SendPayload(ctx, uuid.NewString(), ChannelLSP, &workspaceID, json.RawMessage(payload))
+		p.mu.Lock()
+		active, ok := p.active[workspaceID]
+		p.mu.Unlock()
+		if !ok {
+			continue
+		}
+		_ = active.conn.SendPayload(active.ctx, uuid.NewString(), ChannelLSP, &workspaceID, json.RawMessage(payload))
 	}
 }
 
