@@ -261,7 +261,7 @@ func (p *LSPProxy) Handler() Handler {
 			// model guarantees for anything sequenced before a `go`
 			// (unlike two goroutines racing on the same field).
 			p.replayHandshake(workspaceID, server)
-			go p.pump(workspaceID, server)
+			go p.pump(workspaceID, languageID, server)
 		}
 
 		if err := server.write(env.Payload); err != nil {
@@ -365,7 +365,18 @@ func (p *LSPProxy) serverFor(ctx context.Context, workspaceID, languageID string
 // was never actually exercised long enough in one sitting to notice it
 // independently, but there's no reason to assume it doesn't have the
 // exact same failure mode).
-func (p *LSPProxy) pump(workspaceID string, server *lspServer) {
+//
+// `readMessage` returning an error means the process is gone (crashed,
+// killed — confirmed live: a real `vtsls` can die from `SIGKILL` under
+// memory pressure, entirely independent of anything the client does) or
+// its stdout closed. Before this called `evictDeadServer`, that left the
+// dead entry in `p.servers` forever: every future request for this same
+// (workspaceID, languageID) kept being routed to a handle that could
+// never respond again — writes to its closed stdin pipe either error
+// immediately or vanish, and either way no client request against it
+// ever completes again, silently, until the whole daemon restarts.
+func (p *LSPProxy) pump(workspaceID, languageID string, server *lspServer) {
+	defer p.evictDeadServer(workspaceID, languageID, server)
 	for {
 		payload, err := server.readMessage()
 		if err != nil {
@@ -382,6 +393,21 @@ func (p *LSPProxy) pump(workspaceID string, server *lspServer) {
 			continue
 		}
 		_ = active.conn.SendPayload(active.ctx, uuid.NewString(), ChannelLSP, &workspaceID, json.RawMessage(payload))
+	}
+}
+
+// evictDeadServer removes server from p.servers if it's still the
+// current entry for (workspaceID, languageID) — the `server ==` check
+// guards against a narrow race where a newer server has already replaced
+// this one (e.g. this exact (workspaceID, languageID) got re-spawned
+// between this pump's last read and its eviction running), which would
+// otherwise evict the wrong (live) entry.
+func (p *LSPProxy) evictDeadServer(workspaceID, languageID string, server *lspServer) {
+	key := workspaceID + "\x00" + languageID
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.servers[key] == server {
+		delete(p.servers, key)
 	}
 }
 

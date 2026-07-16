@@ -258,7 +258,15 @@ func (p *Proxy) rejectUnsupportedStopOnEntry(workspaceID string, payload json.Ra
 // either's doc comment for the full story: a stale, closed connection's
 // cancelled `ctx` silently swallowed every relay forever after any
 // reconnect).
+//
+// `readMessage` erroring means the adapter process died — evicting it
+// from `p.servers` (see `evictDeadServer`) is the same fix `LSPProxy.pump`
+// got after a real `vtsls` was confirmed dying under memory pressure
+// independent of the client: without eviction, every later request for
+// this Workspace would keep being routed to a handle that can never
+// respond again, silently, until the whole daemon restarts.
 func (p *Proxy) pump(workspaceID string, server *adapterServer) {
+	defer p.evictDeadServer(workspaceID, server)
 	for {
 		payload, err := server.readMessage()
 		if err != nil {
@@ -271,6 +279,18 @@ func (p *Proxy) pump(workspaceID string, server *adapterServer) {
 			continue
 		}
 		_ = active.conn.SendPayload(active.ctx, uuid.NewString(), ws.ChannelDebug, &workspaceID, json.RawMessage(payload))
+	}
+}
+
+// evictDeadServer removes server from p.servers if it's still the
+// current entry for workspaceID — guards against a narrow race where a
+// newer server has already replaced this one, which would otherwise
+// evict the wrong (live) entry.
+func (p *Proxy) evictDeadServer(workspaceID string, server *adapterServer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.servers[workspaceID] == server {
+		delete(p.servers, workspaceID)
 	}
 }
 

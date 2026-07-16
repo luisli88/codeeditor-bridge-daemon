@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,14 @@ import (
 // Language Server installed.
 func catCommand(languageID string) (string, []string, error) {
 	return "cat", nil, nil
+}
+
+// `true` exits immediately, closing its stdout right away — stands in
+// for a Language Server process that dies almost as soon as it starts
+// (a real `vtsls` doing exactly this under memory pressure, `SIGKILL`,
+// is what actually exposed the bug this file's own eviction test is for).
+func trueCommand(languageID string) (string, []string, error) {
+	return "true", nil, nil
 }
 
 func TestLSPProxy_DidOpen_RoutesAndEchoesThroughRealFraming(t *testing.T) {
@@ -303,4 +312,74 @@ func TestLSPProxy_InstallFailure_ReturnsError(t *testing.T) {
 	require.NoError(t, wsjson.Read(ctx, c, &resp))
 	require.NotNil(t, resp.Error)
 	require.Equal(t, "lsp-launch-failed", resp.Error.Code)
+}
+
+// Regression test for a bug found live: a real vtsls process can die
+// (SIGKILL, confirmed under memory pressure from a long test session)
+// entirely independent of anything the client does. Before
+// LSPProxy.evictDeadServer, the dead entry stayed in `servers` forever —
+// every later request for the same (workspaceID, languageID) kept being
+// routed to a handle that could never respond again, silently, until the
+// whole daemon restarted. This is exactly "no aparece nada" after typing
+// a trigger character: the request went out, but nothing was ever going
+// to answer it.
+func TestLSPProxy_ServerProcessDies_NextRequestRespawnsInsteadOfReusingDeadHandle(t *testing.T) {
+	fakeDevpodSSHScript(t)
+	var mu sync.Mutex
+	spawnCount := 0
+	proxy := ws.NewLSPProxy(trueCommand, func(ctx context.Context, workspaceID, languageID string) error {
+		mu.Lock()
+		spawnCount++
+		mu.Unlock()
+		return nil
+	})
+	srv := ws.NewServer()
+	srv.Handle(ws.ChannelLSP, proxy.Handler())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	c, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	defer c.CloseNow() //nolint:errcheck
+
+	workspaceID := "ws-1"
+	didOpen, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "textDocument/didOpen",
+		"params": map[string]any{"textDocument": map[string]any{"languageId": "go", "uri": "file:///main.go"}},
+	})
+	require.NoError(t, err)
+
+	// Spawns a server that dies almost immediately (`true` exits right
+	// away) — nothing ever answers this first didOpen, which is expected.
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-1", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: didOpen,
+	}))
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return spawnCount == 1
+	}, 5*time.Second, 20*time.Millisecond, "first didOpen should have spawned a server")
+
+	// pump noticing the dead process and evicting it is itself async and
+	// races with this test — retrying the send (a fresh envelope each
+	// time, since a WS message can't be replayed) until it lands *after*
+	// eviction, rather than sending once and hoping the timing lines up,
+	// is what actually waits out that race. Without evictDeadServer, this
+	// would just keep reusing the same dead handle forever and spawnCount
+	// would never reach 2, correctly failing the test on timeout.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		count := spawnCount
+		mu.Unlock()
+		if count >= 2 {
+			return true
+		}
+		_ = wsjson.Write(ctx, c, ws.Envelope{
+			ID: "req-2", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: didOpen,
+		})
+		return false
+	}, 5*time.Second, 50*time.Millisecond, "second didOpen should eventually respawn instead of reusing the dead server")
 }

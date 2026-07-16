@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,4 +149,62 @@ func TestDebugProxy_StopOnEntry_AllowedForSupportedLanguage(t *testing.T) {
 	resp := sendDebugMessage(t, c, "ws-1", launchWithStopOnEntry)
 
 	require.Nil(t, resp.Error)
+}
+
+// Regression test mirroring lsp_proxy_test.go's own — same
+// evictDeadServer fix, same underlying bug: an adapter process that dies
+// (crash, `SIGKILL`, ...) independent of anything the client does used
+// to leave a permanently-dead entry in `Proxy.servers`, silently routing
+// every later request for the Workspace to a handle that could never
+// respond again.
+func TestDebugProxy_AdapterProcessDies_NextRequestRespawnsInsteadOfReusingDeadHandle(t *testing.T) {
+	fakeDevpodSSHScript(t)
+	var mu sync.Mutex
+	spawnCount := 0
+	command := func(language string) (string, []string, bool) {
+		mu.Lock()
+		spawnCount++
+		mu.Unlock()
+		return "true", nil, true
+	}
+	proxy := debug.NewProxy(command)
+	c, cleanup := dialDebugChannel(t, proxy)
+	defer cleanup()
+
+	launch := map[string]any{
+		"command": "launch", "arguments": map[string]any{"language": "go", "program": "/ws/main.go"},
+	}
+	payload, err := json.Marshal(launch)
+	require.NoError(t, err)
+	workspaceID := "ws-1"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Spawns an adapter that dies almost immediately (`true` exits right
+	// away) — nothing ever answers this first launch, which is expected.
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-1", Channel: ws.ChannelDebug, WorkspaceID: &workspaceID, Payload: payload,
+	}))
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return spawnCount == 1
+	}, 5*time.Second, 20*time.Millisecond, "first launch should have spawned an adapter")
+
+	// pump noticing the dead process and evicting it is async — retrying
+	// the send (a fresh envelope each time) until it lands after eviction
+	// waits out that race instead of hoping the timing lines up.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		count := spawnCount
+		mu.Unlock()
+		if count >= 2 {
+			return true
+		}
+		_ = wsjson.Write(ctx, c, ws.Envelope{
+			ID: "req-2", Channel: ws.ChannelDebug, WorkspaceID: &workspaceID, Payload: payload,
+		})
+		return false
+	}, 5*time.Second, 50*time.Millisecond, "second launch should eventually respawn instead of reusing the dead adapter")
 }
