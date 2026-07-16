@@ -32,6 +32,16 @@ type lspServer struct {
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
 	mu     sync.Mutex // guards concurrent writes to stdin
+
+	// handshakeReplayID, if set, is the JSON-RPC id of an `initialize`
+	// request `replayHandshake` wrote to this server on the client's
+	// behalf (see that function's doc comment) — `pump` swallows the one
+	// response carrying this id instead of relaying it to the client,
+	// which already got its own (synthetic) `initialize` response
+	// earlier and would treat a second one for the same id as a stray.
+	// Only `pump` (a single goroutine per server) reads or clears this,
+	// so it needs no lock of its own.
+	handshakeReplayID string
 }
 
 // startLSPServer runs name+args inside workspaceID's devpod Workspace
@@ -122,6 +132,18 @@ type lspActiveConnection struct {
 	conn *Conn
 }
 
+// lspHandshake buffers a Workspace's real `initialize`/`initialized`
+// messages (answered synthetically to the client the moment they arrive —
+// see `Handler`) so `replayHandshake` can send the *real* client-supplied
+// params (rootUri, capabilities, ...) to whichever Language Server process
+// gets spawned first, keeping that real subprocess's own handshake honest
+// even though the client itself heard back long before any subprocess
+// existed.
+type lspHandshake struct {
+	initializePayload  json.RawMessage
+	initializedPayload json.RawMessage // nil until `initialized` arrives
+}
+
 type LSPProxy struct {
 	command         LSPCommand
 	ensureInstalled EnsureInstalledFunc
@@ -130,6 +152,7 @@ type LSPProxy struct {
 	servers        map[string]*lspServer          // key: workspaceID + "\x00" + languageID
 	activeLanguage map[string]string              // workspaceID -> most recently opened languageID
 	active         map[string]lspActiveConnection // workspaceID -> most recent (ctx, conn) pair
+	handshake      map[string]*lspHandshake       // workspaceID -> buffered initialize/initialized to replay into each newly spawned server
 }
 
 // EnsureInstalledFunc installs languageID's Language Server if it isn't
@@ -151,6 +174,7 @@ func NewLSPProxy(command LSPCommand, ensureInstalled EnsureInstalledFunc) *LSPPr
 		servers:         make(map[string]*lspServer),
 		activeLanguage:  make(map[string]string),
 		active:          make(map[string]lspActiveConnection),
+		handshake:       make(map[string]*lspHandshake),
 	}
 }
 
@@ -168,6 +192,48 @@ func (p *LSPProxy) Handler() Handler {
 		p.mu.Lock()
 		p.active[workspaceID] = lspActiveConnection{ctx: ctx, conn: conn}
 		p.mu.Unlock()
+
+		// `initialize`/`initialized` are LSP's own handshake, and a
+		// spec-compliant client always sends `initialize` *before*
+		// anything else — including the very first `textDocument/
+		// didOpen` this proxy relies on to learn which language's
+		// server to route to. Routing them like every other message
+		// would mean rejecting that first `initialize` outright (no
+		// language known yet) with `lsp-no-active-session`, which a
+		// real client can't recover from: `initialize` blocks
+		// everything else the client sends until it gets a response,
+		// so the `didOpen` that would've told us the language never
+		// arrives either — a deadlock, not just a dropped message.
+		// Answered here instead, synthetically, without forwarding to
+		// any subprocess: this app never inspects the capabilities a
+		// real server would've negotiated, so an honest "nothing
+		// negotiated yet" result satisfies the handshake contract
+		// (LSPClientService.connect awaits exactly this) while leaving
+		// the actual language server spawn deferred to the first real
+		// `didOpen`, same as before. The real payloads are buffered so
+		// `replayHandshake` can still give whichever subprocess gets
+		// spawned first the *real* handshake it needs (rootUri,
+		// capabilities, ...) — a real Language Server that never sees
+		// its own `initialize` won't have activated its language
+		// service by the time `didOpen` arrives, so completion/etc.
+		// would fail even though the routing deadlock is gone.
+		if method, ok := messageMethod(env.Payload); ok {
+			switch method {
+			case "initialize":
+				p.mu.Lock()
+				p.handshake[workspaceID] = &lspHandshake{initializePayload: env.Payload}
+				p.mu.Unlock()
+				respondToInitialize(ctx, conn, env, workspaceID)
+				return
+			case "initialized":
+				p.mu.Lock()
+				if hs, ok := p.handshake[workspaceID]; ok {
+					hs.initializedPayload = env.Payload
+				}
+				p.mu.Unlock()
+				return // notification — no response expected, nothing to forward yet
+			}
+		}
 
 		languageID, ok := languageIDFromDidOpen(env.Payload)
 		if ok {
@@ -188,6 +254,13 @@ func (p *LSPProxy) Handler() Handler {
 			return
 		}
 		if isNew {
+			// Replay before `pump` starts reading — not just ordering
+			// for its own sake: `pump` reads `server.handshakeReplayID`
+			// without its own lock, so everything this call sets must
+			// happen-before the `go` statement below, which Go's memory
+			// model guarantees for anything sequenced before a `go`
+			// (unlike two goroutines racing on the same field).
+			p.replayHandshake(workspaceID, server)
 			go p.pump(workspaceID, server)
 		}
 
@@ -195,6 +268,55 @@ func (p *LSPProxy) Handler() Handler {
 			conn.SendError(env, "lsp-write-failed", err.Error(), nil)
 		}
 	}
+}
+
+// replayHandshake sends server the real `initialize` (and, if it already
+// arrived, `initialized`) the client sent earlier for workspaceID — see
+// `Handler`'s doc comment on why the client itself was already answered
+// synthetically and can't just be forwarded the subprocess's own response
+// for the same request id. The replayed `initialize` gets a fresh id
+// (`lspServer.handshakeReplayID`) so `pump` can recognize and swallow its
+// response instead of relaying a second, stray answer to the client.
+// No-ops if this Workspace's client never sent `initialize` (e.g. a
+// synthetic/manual test) — server behaves exactly as it did before this
+// replay mechanism existed.
+func (p *LSPProxy) replayHandshake(workspaceID string, server *lspServer) {
+	p.mu.Lock()
+	hs, ok := p.handshake[workspaceID]
+	p.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	replayID := uuid.NewString()
+	payload, err := withReplayID(hs.initializePayload, replayID)
+	if err != nil {
+		return
+	}
+	server.handshakeReplayID = replayID
+	if err := server.write(payload); err != nil {
+		return
+	}
+	if hs.initializedPayload != nil {
+		_ = server.write(hs.initializedPayload)
+	}
+}
+
+// withReplayID returns payload with its top-level JSON-RPC "id" replaced
+// by id, leaving every other field untouched — used to give a replayed
+// `initialize` request an id `pump` can recognize without colliding with
+// any id the real client itself used.
+func withReplayID(payload json.RawMessage, id string) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return nil, err
+	}
+	quotedID, err := json.Marshal(id)
+	if err != nil {
+		return nil, err
+	}
+	fields["id"] = quotedID
+	return json.Marshal(fields)
 }
 
 func (p *LSPProxy) currentLanguage(workspaceID string) (string, bool) {
@@ -249,6 +371,10 @@ func (p *LSPProxy) pump(workspaceID string, server *lspServer) {
 		if err != nil {
 			return
 		}
+		if id, ok := messageID(payload); ok && server.handshakeReplayID != "" && id == server.handshakeReplayID {
+			server.handshakeReplayID = "" // only the one, replayed initialize response
+			continue
+		}
 		p.mu.Lock()
 		active, ok := p.active[workspaceID]
 		p.mu.Unlock()
@@ -257,6 +383,52 @@ func (p *LSPProxy) pump(workspaceID string, server *lspServer) {
 		}
 		_ = active.conn.SendPayload(active.ctx, uuid.NewString(), ChannelLSP, &workspaceID, json.RawMessage(payload))
 	}
+}
+
+// messageMethod peeks at a JSON-RPC message's `method` field without
+// otherwise interpreting it — used to special-case the handshake
+// (`initialize`/`initialized`) before language-based routing applies.
+func messageMethod(payload json.RawMessage) (string, bool) {
+	var msg struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil || msg.Method == "" {
+		return "", false
+	}
+	return msg.Method, true
+}
+
+// messageID extracts a JSON-RPC message's string "id" field — used only to
+// recognize `pump`'s own replayed-handshake response (always a UUID string
+// this proxy itself generates via `replayHandshake`), not as general
+// id extraction: a real client's ids are just as often numbers, which this
+// deliberately doesn't attempt to decode.
+func messageID(payload json.RawMessage) (string, bool) {
+	var msg struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil || msg.ID == "" {
+		return "", false
+	}
+	return msg.ID, true
+}
+
+// respondToInitialize answers an `initialize` request with a minimal,
+// honest "nothing negotiated" result, echoing the request's own JSON-RPC
+// `id` (not `env.ID`, the unrelated WebSocket envelope id) so the caller's
+// pending request resolves.
+func respondToInitialize(ctx context.Context, conn *Conn, env Envelope, workspaceID string) {
+	var msg struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(env.Payload, &msg); err != nil || len(msg.ID) == 0 {
+		return
+	}
+	_ = conn.SendPayload(ctx, uuid.NewString(), ChannelLSP, &workspaceID, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      msg.ID,
+		"result":  map[string]any{"capabilities": map[string]any{}},
+	})
 }
 
 func languageIDFromDidOpen(payload json.RawMessage) (string, bool) {

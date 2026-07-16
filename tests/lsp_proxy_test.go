@@ -125,6 +125,90 @@ func TestLSPProxy_SecondConnectionAfterFirstCloses_StillReceivesOutput(t *testin
 	require.JSONEq(t, string(secondPayload), string(secondResp.Payload))
 }
 
+// A spec-compliant LSP client always sends `initialize` before anything
+// else — including the first `textDocument/didOpen` this proxy otherwise
+// relies on to learn which language to route to. Regression test for the
+// bug found via a real end-to-end WS client against a live daemon: the
+// proxy rejected that very first `initialize` with `lsp-no-active-session`
+// (no language known yet), which a real client can't recover from since it
+// blocks on `initialize`'s response before sending anything else — a
+// deadlock, not just a dropped message, and the reason LSP never worked at
+// all regardless of every other fix in this file's history.
+func TestLSPProxy_Initialize_BeforeAnyDidOpen_SucceedsSynthetically(t *testing.T) {
+	fakeDevpodSSHScript(t)
+	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, workspaceID, languageID string) error { return nil })
+	srv := ws.NewServer()
+	srv.Handle(ws.ChannelLSP, proxy.Handler())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	c, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	defer c.CloseNow() //nolint:errcheck
+
+	workspaceID := "ws-1"
+
+	initialize, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"processId": nil, "rootUri": nil, "capabilities": map[string]any{}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-1", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: initialize,
+	}))
+
+	var initResp ws.Envelope
+	require.NoError(t, wsjson.Read(ctx, c, &initResp))
+	require.Nil(t, initResp.Error, "initialize must not be rejected before any didOpen")
+	var decoded struct {
+		ID     int `json:"id"`
+		Result struct {
+			Capabilities map[string]any `json:"capabilities"`
+		} `json:"result"`
+	}
+	require.NoError(t, json.Unmarshal(initResp.Payload, &decoded))
+	require.Equal(t, 1, decoded.ID)
+
+	initialized, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": "initialized", "params": map[string]any{}})
+	require.NoError(t, err)
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-2", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: initialized,
+	}))
+
+	// The handshake must not have spawned or blocked anything — a real
+	// didOpen still routes and echoes normally right after.
+	didOpenPayload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "textDocument/didOpen",
+		"params": map[string]any{"textDocument": map[string]any{"languageId": "go", "uri": "file:///main.go"}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-3", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: didOpenPayload,
+	}))
+
+	// `cat` (this test's stand-in Language Server, see `catCommand`) echoes
+	// literally everything written to its stdin, including the replayed
+	// `initialize`/`initialized` `replayHandshake` sends it once it spawns
+	// — a real Language Server wouldn't echo those back on its own (they
+	// have no output of their own, or their `initialize` response is
+	// swallowed by `pump` before reaching here), so tolerate and skip that
+	// echo noise instead of asserting on it; the one message that matters
+	// is the didOpen echo actually arriving, proving the handshake replay
+	// didn't wedge routing for the message that triggered it.
+	var didOpenResp ws.Envelope
+	for range 5 {
+		require.NoError(t, wsjson.Read(ctx, c, &didOpenResp))
+		require.Nil(t, didOpenResp.Error)
+		if string(didOpenResp.Payload) == string(didOpenPayload) {
+			return
+		}
+	}
+	t.Fatalf("didOpen echo never arrived; last message: %s", didOpenResp.Payload)
+}
+
 func TestLSPProxy_NoWorkspaceID_ReturnsError(t *testing.T) {
 	proxy := ws.NewLSPProxy(catCommand, func(ctx context.Context, workspaceID, languageID string) error { return nil })
 	srv := ws.NewServer()
