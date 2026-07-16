@@ -29,6 +29,7 @@ func newTmuxSessionName(t *testing.T) session.TmuxSessionName {
 // The Terminal channel round-trips real bytes through a real `tmux`
 // session — attach, write a command, read the echoed output back.
 func TestShellSessions_AttachWriteRead_RoundTripsThroughRealTmux(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	sessions := session.NewShellSessions(newTmuxSessionName(t))
 	srv := ws.NewServer()
 	srv.Handle(ws.ChannelShell, sessions.Handler())
@@ -74,6 +75,7 @@ func TestShellSessions_AttachWriteRead_RoundTripsThroughRealTmux(t *testing.T) {
 // The claude-auth output watcher taps the same PTY stream without
 // disrupting the shell channel's own relay.
 func TestShellSessions_OutputWatcher_SeesSameBytesAsShellChannel(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	sessions := session.NewShellSessions(newTmuxSessionName(t))
 	detector := session.NewAuthDetector()
 	sessions.SetOutputWatcher(detector.Watch())
@@ -121,6 +123,7 @@ func TestShellSessions_OutputWatcher_SeesSameBytesAsShellChannel(t *testing.T) {
 // other channels make between a first, session-opening request and every
 // following one.
 func TestShellSessions_SecondEnvelopeSameWorkspace_ReusesAttachedPTY(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	sessions := session.NewShellSessions(newTmuxSessionName(t))
 	srv := ws.NewServer()
 	srv.Handle(ws.ChannelShell, sessions.Handler())
@@ -200,6 +203,7 @@ func TestShellSessions_NoWorkspaceID_ReturnsError(t *testing.T) {
 // A first Envelope with no payload just opens the session — no PTY write,
 // no crash.
 func TestShellSessions_NilPayload_JustAttaches(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	sessions := session.NewShellSessions(newTmuxSessionName(t))
 	srv := ws.NewServer()
 	srv.Handle(ws.ChannelShell, sessions.Handler())
@@ -228,6 +232,7 @@ func TestShellSessions_NilPayload_JustAttaches(t *testing.T) {
 }
 
 func TestShellSessions_MalformedPayload_IsIgnored(t *testing.T) {
+	fakeDevpodSSHScript(t)
 	sessions := session.NewShellSessions(newTmuxSessionName(t))
 	srv := ws.NewServer()
 	srv.Handle(ws.ChannelShell, sessions.Handler())
