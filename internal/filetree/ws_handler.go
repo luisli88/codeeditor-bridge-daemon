@@ -39,6 +39,12 @@ func (b *Browser) Handler() ws.Handler {
 				return
 			}
 			_ = conn.SendPayload(ctx, env.ID, ws.ChannelFS, &workspaceID, Response{Action: "read", Path: req.Path, Content: content})
+		case "write":
+			if err := b.Write(workspaceID, req.Path, req.Content); err != nil {
+				conn.SendError(env, fsErrorCode(err), err.Error(), nil)
+				return
+			}
+			_ = conn.SendPayload(ctx, env.ID, ws.ChannelFS, &workspaceID, Response{Action: "write", Path: req.Path})
 		default:
 			conn.SendError(env, "unknown-action", fmt.Sprintf("acción de fs desconocida: %q", req.Action), nil)
 		}

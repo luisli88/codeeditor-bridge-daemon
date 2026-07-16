@@ -1,8 +1,6 @@
 // Package filetree implements the `fs` channel (contracts/websocket-protocol.md
-// → Canal `fs`): read-only directory listing and file content for a
-// Workspace's real filesystem clone. No write/rename/delete, no filesystem
-// watching — deferred to a later increment (FR-030's editor only needs to
-// read a file to open it; nothing in this module persists edits back yet).
+// → Canal `fs`): directory listing, file content, and saving a file back —
+// no rename/delete/filesystem watching, deferred to a later increment.
 package filetree
 
 import (
@@ -19,8 +17,9 @@ import (
 // multi-step workflow to name phases of). Path is always workspace-relative;
 // "" means the workspace root.
 type Request struct {
-	Action string `json:"action"` // "list" | "read"
-	Path   string `json:"path,omitempty"`
+	Action  string `json:"action"` // "list" | "read" | "write"
+	Path    string `json:"path,omitempty"`
+	Content string `json:"content,omitempty"` // "write" only — the file's full new content
 }
 
 // Entry is one child of a listed directory — metadata only
@@ -138,4 +137,21 @@ func (b *Browser) Read(workspaceID, path string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// Write overwrites path's file content, relative to workspaceID's root.
+// Creates the file if it doesn't already exist, but not a missing parent
+// directory — the editor only ever opens a file `List` already reported,
+// so there's always a real parent directory for a save to land in; a
+// brand-new file (not opened from an existing listing) isn't a case this
+// increment needs to handle.
+func (b *Browser) Write(workspaceID, path, content string) error {
+	full, err := b.resolvePath(workspaceID, path)
+	if err != nil {
+		return err
+	}
+	if info, err := os.Stat(full); err == nil && info.IsDir() {
+		return fmt.Errorf("%w: %q", ErrNotAFile, path)
+	}
+	return os.WriteFile(full, []byte(content), 0o644)
 }

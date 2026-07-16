@@ -120,3 +120,46 @@ func TestBrowser_Read_PathEscapesWorkspace_ReturnsInvalidPath(t *testing.T) {
 
 	require.ErrorIs(t, err, filetree.ErrInvalidPath)
 }
+
+func TestBrowser_Write_OverwritesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "README.md", "old content\n")
+	browser := newTestBrowser(dir)
+
+	err := browser.Write("ws-1", "README.md", "new content\n")
+
+	require.NoError(t, err)
+	content, err := browser.Read("ws-1", "README.md")
+	require.NoError(t, err)
+	require.Equal(t, "new content\n", content)
+}
+
+func TestBrowser_Write_MissingFile_CreatesIt(t *testing.T) {
+	dir := t.TempDir()
+	browser := newTestBrowser(dir)
+
+	err := browser.Write("ws-1", "new.txt", "content\n")
+
+	require.NoError(t, err)
+	content, err := browser.Read("ws-1", "new.txt")
+	require.NoError(t, err)
+	require.Equal(t, "content\n", content)
+}
+
+func TestBrowser_Write_OnADirectory_ReturnsNotAFile(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "src"), 0o755))
+	browser := newTestBrowser(dir)
+
+	err := browser.Write("ws-1", "src", "content\n")
+
+	require.ErrorIs(t, err, filetree.ErrNotAFile)
+}
+
+func TestBrowser_Write_PathEscapesWorkspace_ReturnsInvalidPath(t *testing.T) {
+	browser := newTestBrowser(t.TempDir())
+
+	err := browser.Write("ws-1", "../../etc/passwd", "pwned\n")
+
+	require.ErrorIs(t, err, filetree.ErrInvalidPath)
+}

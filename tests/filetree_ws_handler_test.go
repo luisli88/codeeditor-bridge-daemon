@@ -83,6 +83,26 @@ func TestFileTreeHandler_Read_ReturnsRealContent(t *testing.T) {
 	require.Equal(t, "hello\n", resp.Content)
 }
 
+func TestFileTreeHandler_Write_PersistsRealContent(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "README.md", "old\n")
+	browser := filetree.NewBrowser(func(workspaceID string) string { return dir })
+	c, cleanup := newFileTreeTestServer(t, browser)
+	defer cleanup()
+
+	env := sendFileTreeRequest(t, c, "ws-1", filetree.Request{Action: "write", Path: "README.md", Content: "new\n"})
+
+	require.Nil(t, env.Error, "unexpected error: %+v", env.Error)
+	var resp filetree.Response
+	require.NoError(t, json.Unmarshal(env.Payload, &resp))
+	require.Equal(t, "write", resp.Action)
+
+	readEnv := sendFileTreeRequest(t, c, "ws-1", filetree.Request{Action: "read", Path: "README.md"})
+	var readResp filetree.Response
+	require.NoError(t, json.Unmarshal(readEnv.Payload, &readResp))
+	require.Equal(t, "new\n", readResp.Content)
+}
+
 func TestFileTreeHandler_NoWorkspaceID_ReturnsError(t *testing.T) {
 	browser := filetree.NewBrowser(func(workspaceID string) string { return t.TempDir() })
 	srv := ws.NewServer()
