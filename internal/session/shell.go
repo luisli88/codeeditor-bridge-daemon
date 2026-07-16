@@ -44,19 +44,33 @@ type TmuxSessionName func(workspaceID string) string
 // without that detector needing its own separate PTY attachment.
 type OutputWatcher func(ctx context.Context, conn *ws.Conn, workspaceID string, data []byte)
 
+// activeConnection is whichever (ctx, conn) pair most recently sent an
+// Envelope for a Workspace's `shell` channel — see `pump`'s doc comment
+// for why this needs to be looked up fresh on every relay instead of
+// captured once.
+type activeConnection struct {
+	ctx  context.Context
+	conn *ws.Conn
+}
+
 // ShellSessions holds one attached PTY per Workspace, reused across every
 // Envelope on the `shell` channel for that Workspace — attaching to tmux
 // fresh on every keystroke would be wrong and slow.
 type ShellSessions struct {
 	mu       sync.Mutex
 	attached map[string]*os.File
+	active   map[string]activeConnection
 	name     TmuxSessionName
 	watcher  OutputWatcher
 }
 
 // NewShellSessions builds an empty ShellSessions.
 func NewShellSessions(name TmuxSessionName) *ShellSessions {
-	return &ShellSessions{attached: make(map[string]*os.File), name: name}
+	return &ShellSessions{
+		attached: make(map[string]*os.File),
+		active:   make(map[string]activeConnection),
+		name:     name,
+	}
 }
 
 // SetOutputWatcher registers watcher to receive every chunk of PTY
@@ -77,13 +91,22 @@ func (s *ShellSessions) Handler() ws.Handler {
 		}
 		workspaceID := *env.WorkspaceID
 
+		// Recorded on every Envelope, not just the one that creates the
+		// PTY — a reconnect (app relaunch, dropped WS, ...) sends a new
+		// `conn`/`ctx` pair for a Workspace whose PTY is already
+		// attached (`isNew` false below), and `pump`'s goroutine — still
+		// alive, still reading the same tmux session — needs to notice.
+		s.mu.Lock()
+		s.active[workspaceID] = activeConnection{ctx: ctx, conn: conn}
+		s.mu.Unlock()
+
 		ptmx, isNew, err := s.attach(workspaceID)
 		if err != nil {
 			conn.SendError(env, "tmux-attach-failed", err.Error(), nil)
 			return
 		}
 		if isNew {
-			go s.pump(ctx, conn, workspaceID, ptmx)
+			go s.pump(workspaceID, ptmx)
 		}
 
 		if env.Payload == nil {
@@ -163,10 +186,25 @@ func ensureTmuxInstalled(workspaceID string) error {
 // pump streams PTY output back to the client as ShellPayload Envelopes
 // until the session ends, then forgets the attachment so the next Envelope
 // on this Workspace reattaches.
-func (s *ShellSessions) pump(ctx context.Context, conn *ws.Conn, workspaceID string, ptmx *os.File) {
+//
+// Reads `s.active[workspaceID]` fresh on every chunk instead of a `conn`/
+// `ctx` captured once at goroutine start — this goroutine is started only
+// the *first* time a Workspace's PTY is created (`isNew` in `Handler`)
+// and then lives for as long as tmux does, but the WebSocket connection
+// that happened to trigger that first attach is under no obligation to
+// live that long too (an app relaunch, a dropped connection, ...). With a
+// captured `conn` this goroutine kept writing to that first, now-closed
+// connection forever, and `ctx` being that connection's own
+// (`Server.ServeHTTP`'s `r.Context()`, cancelled the moment it closes)
+// meant every `SendPayload` failed silently — the PTY itself stayed
+// perfectly healthy (confirmed live via `tmux capture-pane` showing real,
+// correct output) while every *new* connection's Terminal sat forever on
+// a blank screen with a live cursor, never receiving a single byte.
+func (s *ShellSessions) pump(workspaceID string, ptmx *os.File) {
 	defer func() {
 		s.mu.Lock()
 		delete(s.attached, workspaceID)
+		delete(s.active, workspaceID)
 		s.mu.Unlock()
 		_ = ptmx.Close()
 	}()
@@ -175,14 +213,16 @@ func (s *ShellSessions) pump(ctx context.Context, conn *ws.Conn, workspaceID str
 	for {
 		n, err := ptmx.Read(buf)
 		if n > 0 {
-			payload := ShellPayload{Data: base64.StdEncoding.EncodeToString(buf[:n])}
-			_ = conn.SendPayload(ctx, uuid.NewString(), ws.ChannelShell, &workspaceID, payload)
-
 			s.mu.Lock()
+			active, ok := s.active[workspaceID]
 			watcher := s.watcher
 			s.mu.Unlock()
-			if watcher != nil {
-				watcher(ctx, conn, workspaceID, buf[:n])
+			if ok {
+				payload := ShellPayload{Data: base64.StdEncoding.EncodeToString(buf[:n])}
+				_ = active.conn.SendPayload(active.ctx, uuid.NewString(), ws.ChannelShell, &workspaceID, payload)
+				if watcher != nil {
+					watcher(active.ctx, active.conn, workspaceID, buf[:n])
+				}
 			}
 		}
 		if err != nil {

@@ -72,6 +72,76 @@ func TestShellSessions_AttachWriteRead_RoundTripsThroughRealTmux(t *testing.T) {
 	}, 8*time.Second, 100*time.Millisecond, "expected to see the echoed marker in the PTY output")
 }
 
+// A second connection for the same Workspace (an app relaunch, a dropped
+// WebSocket, ...) must start receiving PTY output too — not just accept
+// writes while the original pump goroutine, still bound to the first,
+// now-closed connection, silently discards everything it reads. This is
+// a regression test for exactly that bug: found live via `tmux
+// capture-pane` showing real, correct output while the Terminal sat on a
+// permanently blank screen after any reconnect.
+func TestShellSessions_SecondConnectionAfterFirstCloses_StillReceivesOutput(t *testing.T) {
+	fakeDevpodSSHScript(t)
+	sessions := session.NewShellSessions(newTmuxSessionName(t))
+	srv := ws.NewServer()
+	srv.Handle(ws.ChannelShell, sessions.Handler())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	workspaceID := "ws-1"
+
+	send := func(c *websocket.Conn, command string) {
+		payload, err := json.Marshal(map[string]string{"data": base64.StdEncoding.EncodeToString([]byte(command))})
+		require.NoError(t, err)
+		require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+			ID: "req", Channel: ws.ChannelShell, WorkspaceID: &workspaceID, Payload: payload,
+		}))
+	}
+
+	// First connection: attaches (creates the PTY, starts the pump), then
+	// disconnects — same as an app relaunch or a dropped WebSocket.
+	first, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	send(first, "echo FIRST_MARKER\n")
+	require.Eventually(t, func() bool {
+		readCtx, readCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer readCancel()
+		var env ws.Envelope
+		return wsjson.Read(readCtx, first, &env) == nil
+	}, 8*time.Second, 100*time.Millisecond, "expected the first connection to see at least one reply before disconnecting")
+	require.NoError(t, first.CloseNow())
+
+	// Second connection, same Workspace: the PTY/tmux session already
+	// exists (`isNew` is false), so no new pump starts — the existing one
+	// must notice this connection and start writing to it instead.
+	second, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	defer second.CloseNow() //nolint:errcheck
+	send(second, "echo SECOND_MARKER\n")
+
+	require.Eventually(t, func() bool {
+		readCtx, readCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer readCancel()
+		var env ws.Envelope
+		if err := wsjson.Read(readCtx, second, &env); err != nil {
+			return false
+		}
+		var shellPayload struct {
+			Data string `json:"data"`
+		}
+		if err := json.Unmarshal(env.Payload, &shellPayload); err != nil {
+			return false
+		}
+		raw, err := base64.StdEncoding.DecodeString(shellPayload.Data)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(raw), "SECOND_MARKER")
+	}, 8*time.Second, 100*time.Millisecond, "expected the second connection to receive PTY output after the first one closed")
+}
+
 // The claude-auth output watcher taps the same PTY stream without
 // disrupting the shell channel's own relay.
 func TestShellSessions_OutputWatcher_SeesSameBytesAsShellChannel(t *testing.T) {
