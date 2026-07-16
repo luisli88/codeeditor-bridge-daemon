@@ -102,6 +102,12 @@ func (s *ShellSessions) attach(workspaceID string) (*os.File, bool, error) {
 	}
 
 	cmd := exec.Command("tmux", "new-session", "-A", "-s", s.name(workspaceID))
+	// bridged runs as a daemon (systemd/container entrypoint), not from an
+	// interactive shell — it inherits no TERM, and tmux refuses to
+	// initialize the screen without one ("terminal does not support
+	// clear", surfaced verbatim to the client's real terminal emulator).
+	// The client (SwiftTerm) understands xterm-256color.
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, false, fmt.Errorf("attach tmux session for workspace %s: %w", workspaceID, err)
