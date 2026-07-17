@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -22,6 +23,10 @@ import (
 type Runner interface {
 	Up(ctx context.Context, workspacePath string, onEvent func(line string)) error
 	Delete(ctx context.Context, workspaceID string) error
+	// List returns the workspaceID of every devpod Workspace that has
+	// actually finished `up`-ing — Lister's own signal for "ready" vs
+	// still just "cloned".
+	List(ctx context.Context) ([]string, error)
 }
 
 // devpodLogLine is one `--log-output json` line — devpod's own schema
@@ -69,6 +74,41 @@ func (SubprocessRunner) Delete(ctx context.Context, workspaceID string) error {
 		return fmt.Errorf("devpod delete: %w", err)
 	}
 	return nil
+}
+
+// devpodListEntry is the subset of `devpod list --output json`'s schema
+// this package actually needs. `source.localFolder`'s basename, not this
+// same JSON's own (lowercased) `id` field, is what List reports as the
+// workspaceID — `devpod` lowercases `id` internally, but this project's
+// workspaceIDs (client-generated UUIDs) are mixed-case, and Lister needs
+// an exact match against gitmanager.Cloner's own directory names.
+type devpodListEntry struct {
+	Source struct {
+		LocalFolder string `json:"localFolder"`
+	} `json:"source"`
+}
+
+// List returns the workspaceID of every devpod Workspace that has
+// actually finished `up`-ing (i.e. `devpod list` reports it at all —
+// a Workspace that failed devpod-up or never reached that step doesn't
+// show up here).
+func (SubprocessRunner) List(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "devpod", "list", "--output", "json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("devpod list: %w", err)
+	}
+	var entries []devpodListEntry
+	if err := json.Unmarshal(out, &entries); err != nil {
+		return nil, fmt.Errorf("devpod list: parse output: %w", err)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Source.LocalFolder == "" {
+			continue
+		}
+		ids = append(ids, filepath.Base(entry.Source.LocalFolder))
+	}
+	return ids, nil
 }
 
 // runDevpodCommand runs `devpod <args...>`, forwarding each stdout line

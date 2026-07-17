@@ -175,10 +175,26 @@ type lspActiveConnection struct {
 // params (rootUri, capabilities, ...) to whichever Language Server process
 // gets spawned first, keeping that real subprocess's own handshake honest
 // even though the client itself heard back long before any subprocess
-// existed.
+// existed. Also buffers every currently-open document's `didOpen` — see
+// `openDocuments`'s own doc comment for why that's not optional.
 type lspHandshake struct {
 	initializePayload  json.RawMessage
 	initializedPayload json.RawMessage // nil until `initialized` arrives
+	// openDocuments holds the most recent `didOpen` payload per URI,
+	// removed on `didClose` — replayed into a respawned server the same
+	// way initialize/initialized are (`replayHandshake`). Without this, a
+	// Language Server that dies mid-session (confirmed live: a real
+	// process can be SIGKILLed under memory pressure, e.g. `claude`
+	// running heavy in the same Workspace's Terminal) gets a fresh
+	// replacement on the next request — but that replacement has never
+	// heard of any file the Desarrollador already had open, so completion/
+	// diagnostics/etc. against it resolve nothing, silently, forever
+	// (no error either — the server just genuinely has no document at
+	// that URI). Exactly the "autocompletar dejó de funcionar de repente"
+	// symptom, confirmed live: the respawned process was real and healthy
+	// (low CPU, freshly started), it simply never got taught the file
+	// existed.
+	openDocuments map[string]json.RawMessage
 }
 
 type LSPProxy struct {
@@ -258,7 +274,10 @@ func (p *LSPProxy) Handler() Handler {
 			switch method {
 			case "initialize":
 				p.mu.Lock()
-				p.handshake[workspaceID] = &lspHandshake{initializePayload: env.Payload}
+				p.handshake[workspaceID] = &lspHandshake{
+					initializePayload: env.Payload,
+					openDocuments:     make(map[string]json.RawMessage),
+				}
 				p.mu.Unlock()
 				respondToInitialize(ctx, conn, env, workspaceID)
 				return
@@ -269,15 +288,26 @@ func (p *LSPProxy) Handler() Handler {
 				}
 				p.mu.Unlock()
 				return // notification — no response expected, nothing to forward yet
+			case "textDocument/didClose":
+				if uri, ok := textDocumentURI(env.Payload); ok {
+					p.mu.Lock()
+					if hs, ok := p.handshake[workspaceID]; ok {
+						delete(hs.openDocuments, uri)
+					}
+					p.mu.Unlock()
+				}
+				// Falls through to normal routing below — the close still
+				// has to reach whichever server is currently live.
 			}
 		}
 
-		languageID, ok := languageIDFromDidOpen(env.Payload)
-		if ok {
+		languageID, isDidOpen := languageIDFromDidOpen(env.Payload)
+		if isDidOpen {
 			p.mu.Lock()
 			p.activeLanguage[workspaceID] = languageID
 			p.mu.Unlock()
 		} else {
+			var ok bool
 			languageID, ok = p.currentLanguage(workspaceID)
 			if !ok {
 				conn.SendError(env, "lsp-no-active-session", "no hay una sesión LSP activa para este workspace", nil)
@@ -299,6 +329,21 @@ func (p *LSPProxy) Handler() Handler {
 			// response and signal it.
 			go p.pump(workspaceID, languageID, server)
 			p.replayHandshake(workspaceID, server)
+		}
+
+		// Recorded only *after* any replay above already ran — replaying
+		// "every document already open before this request" must never
+		// include the very `didOpen` this request itself is, or a brand
+		// new server would receive it twice (once via replay, once via
+		// the write below).
+		if isDidOpen {
+			if uri, ok := textDocumentURI(env.Payload); ok {
+				p.mu.Lock()
+				if hs, exists := p.handshake[workspaceID]; exists {
+					hs.openDocuments[uri] = env.Payload
+				}
+				p.mu.Unlock()
+			}
 		}
 
 		if err := server.write(env.Payload); err != nil {
@@ -356,6 +401,39 @@ func (p *LSPProxy) replayHandshake(workspaceID string, server *lspServer) {
 	if hs.initializedPayload != nil {
 		_ = server.write(hs.initializedPayload)
 	}
+
+	// Re-teaches the freshly (re)spawned server about every file that was
+	// already open before it existed — see `lspHandshake.openDocuments`'s
+	// doc comment for the real symptom this fixes. Order across different
+	// URIs doesn't matter to the LSP spec; each `didOpen` only concerns
+	// its own document.
+	p.mu.Lock()
+	openDocuments := make([]json.RawMessage, 0, len(hs.openDocuments))
+	for _, payload := range hs.openDocuments {
+		openDocuments = append(openDocuments, payload)
+	}
+	p.mu.Unlock()
+	for _, docPayload := range openDocuments {
+		_ = server.write(docPayload)
+	}
+}
+
+// textDocumentURI extracts a JSON-RPC message's params.textDocument.uri
+// without otherwise interpreting it — shared by the didOpen buffering and
+// didClose eviction above, both of which only care about this one field
+// regardless of the message's other params.
+func textDocumentURI(payload json.RawMessage) (string, bool) {
+	var msg struct {
+		Params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil || msg.Params.TextDocument.URI == "" {
+		return "", false
+	}
+	return msg.Params.TextDocument.URI, true
 }
 
 // withReplayID returns payload with its top-level JSON-RPC "id" replaced

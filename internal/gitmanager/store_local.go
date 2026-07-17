@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +40,40 @@ func (s *LocalFileStore) Put(_ context.Context, ref string, value string) error 
 		return fmt.Errorf("gitmanager: write secret %q: %w", ref, err)
 	}
 	return nil
+}
+
+// List returns every ref under baseDir whose path starts with prefix,
+// walking subdirectories (a ref like "codeeditor/git-credentials/<owner>/
+// <id>" is itself nested a few levels deep). A prefix directory that
+// doesn't exist yet — no credentials registered for this owner at all —
+// returns an empty slice, not an error.
+func (s *LocalFileStore) List(_ context.Context, prefix string) ([]string, error) {
+	if strings.Contains(prefix, "..") {
+		return nil, errors.New("gitmanager: invalid secret prefix")
+	}
+	root := filepath.Join(s.baseDir, filepath.Clean(prefix))
+	var refs []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(s.baseDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		refs = append(refs, rel)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gitmanager: list secrets under %q: %w", prefix, err)
+	}
+	return refs, nil
 }
 
 func (s *LocalFileStore) Get(_ context.Context, ref string) (string, error) {

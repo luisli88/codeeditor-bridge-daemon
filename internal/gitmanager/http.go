@@ -17,6 +17,7 @@ func RegisterRoutes(mux *http.ServeMux, manager *CredentialManager) {
 	mux.HandleFunc("POST /git-credentials/github-derived", registerGitHubDerivedHandler(manager))
 	mux.HandleFunc("POST /git-credentials/reauthenticate", reauthenticateHandler(manager))
 	mux.HandleFunc("POST /git-credentials/verify", verifyHandler(manager))
+	mux.HandleFunc("GET /git-credentials", listCredentialsHandler(manager))
 }
 
 type credentialResponse struct {
@@ -133,6 +134,31 @@ func verifyHandler(manager *CredentialManager) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, credentialResponse{Credential: cred})
+	}
+}
+
+// listCredentialsHandler answers `GET /git-credentials?ownerUserId=...` —
+// lets a Host that already has credentials registered on it (this same
+// device before a reinstall, or a different device entirely) be
+// discovered again instead of staying permanently invisible to a client
+// whose own local SwiftData record of them is gone. Never returns the
+// underlying secret itself, only the same metadata a POST response
+// already exposes.
+func listCredentialsHandler(manager *CredentialManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ownerUserID := r.URL.Query().Get("ownerUserId")
+		if ownerUserID == "" {
+			http.Error(w, "ownerUserId is required", http.StatusBadRequest)
+			return
+		}
+		creds, err := manager.List(r.Context(), ownerUserID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, struct {
+			Credentials []Credential `json:"credentials"`
+		}{Credentials: creds})
 	}
 }
 

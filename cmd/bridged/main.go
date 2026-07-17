@@ -18,6 +18,7 @@ import (
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/entitlements"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/filetree"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/gitmanager"
+	"github.com/luisli88/codeeditor-bridge-daemon/internal/pairing"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/session"
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/ws"
 )
@@ -33,10 +34,20 @@ func main() {
 			"see README.md \"Despliegue\" for the managed-tier (AWS Secrets Manager) gap this doesn't cover",
 	)
 	moshPortRange := flag.String("mosh-udp-port-range", "60000-61000", "UDP port range mosh-server is configured for")
+	pairingTokenFile := flag.String(
+		"pairing-token-file", "/etc/codeeditor/pairing-token",
+		"path to the bearer token every request must present (Authorization: Bearer <token>) — "+
+			"generated on first run if this file doesn't exist yet",
+	)
 	flag.Parse()
 
 	if *tlsCert == "" || *tlsKey == "" {
 		log.Fatal("bridged: --tls-cert and --tls-key are required")
+	}
+
+	token, err := pairing.LoadOrCreateToken(*pairingTokenFile)
+	if err != nil {
+		log.Fatalf("bridged: %v", err)
 	}
 
 	cloner := gitmanager.NewCloner(*workspaceDir)
@@ -48,8 +59,14 @@ func main() {
 	wireProvisioning(mux, cloner, secretStore)
 	mux.Handle("/", wireChannels(cloner, secretStore))
 
+	// No exceptions, `/handshake` included — every route through this
+	// daemon is now behind the pairing token (pairing package's own doc
+	// comment on why: nothing else here ever validated which device is
+	// actually driving it).
+	handler := pairing.Middleware(token, mux)
+
 	log.Printf("bridged: listening on :%d", *port)
-	log.Fatal(http.ListenAndServeTLS(":"+strconv.Itoa(*port), *tlsCert, *tlsKey, mux))
+	log.Fatal(http.ListenAndServeTLS(":"+strconv.Itoa(*port), *tlsCert, *tlsKey, handler))
 }
 
 // wireGitCredentials mounts the git-credentials HTTP surface
@@ -86,7 +103,13 @@ func wireProvisioning(mux *http.ServeMux, cloner *gitmanager.Cloner, secretStore
 		devPodDeleteFunc,
 		os.RemoveAll,
 	)
-	devpod.RegisterRoutes(mux, provisioner)
+	lister := devpod.NewLister(
+		cloner.WorkspacePath,
+		cloner.ListWorkspaceIDs,
+		cloner.RepositoryURL,
+		devpod.SubprocessRunner{},
+	)
+	devpod.RegisterRoutes(mux, provisioner, lister)
 }
 
 // wireChannels builds the multiplexed WebSocket server (contracts/

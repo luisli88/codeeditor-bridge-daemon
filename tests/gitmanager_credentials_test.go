@@ -33,6 +33,16 @@ func (f *fakeSecretStore) Get(ctx context.Context, ref string) (string, error) {
 	return v, nil
 }
 
+func (f *fakeSecretStore) List(ctx context.Context, prefix string) ([]string, error) {
+	var refs []string
+	for ref := range f.values {
+		if strings.HasPrefix(ref, prefix) {
+			refs = append(refs, ref)
+		}
+	}
+	return refs, nil
+}
+
 type fakeValidator struct {
 	shouldFail bool
 }
@@ -196,4 +206,67 @@ func TestReauthenticate_SecretStoreFails_ReturnsError(t *testing.T) {
 	err = failingManager.Reauthenticate(context.Background(), &cred, "new-token")
 
 	require.Error(t, err)
+}
+
+// Regression coverage for the reconciliation gap: a Host that already has
+// credentials registered on it (from this same device before a reinstall,
+// or from a different device entirely) had no way to be discovered again
+// — SecretStore only ever supported storing/reading one exact ref, never
+// enumerating what's there. List reconstructs each Credential from the
+// metadata RegisterPAT/GenerateSSHKey/etc. now also persist alongside the
+// secret itself.
+func TestList_ReturnsEveryCredentialRegisteredForOwner_NotOthers(t *testing.T) {
+	store := newFakeSecretStore()
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: false})
+	ctx := context.Background()
+
+	pat, err := manager.RegisterPAT(ctx, "owner-1", "GitHub Token", "github.com", "ghp_token")
+	require.NoError(t, err)
+	generated, _, err := manager.GenerateSSHKey(ctx, "owner-1", "My Key", "gitlab.com")
+	require.NoError(t, err)
+	// A different owner's credential must never leak into owner-1's list.
+	_, err = manager.RegisterPAT(ctx, "owner-2", "Other Owner's Token", "github.com", "ghp_other")
+	require.NoError(t, err)
+
+	creds, err := manager.List(ctx, "owner-1")
+
+	require.NoError(t, err)
+	require.Len(t, creds, 2)
+	byID := map[string]gitmanager.Credential{}
+	for _, c := range creds {
+		byID[c.ID] = c
+	}
+	assert.Equal(t, "GitHub Token", byID[pat.ID].Alias)
+	assert.Equal(t, gitmanager.CredentialStatusVerified, byID[pat.ID].Status)
+	assert.Equal(t, gitmanager.CredentialKindSSHKey, byID[generated.ID].Kind)
+	assert.Equal(t, gitmanager.CredentialStatusUnverified, byID[generated.ID].Status)
+}
+
+// A freshly generated SSH key starts unverified — List must reflect the
+// *current* status once Verify actually confirms it, not the stale one
+// from the moment it was generated.
+func TestList_ReflectsStatusAfterVerify(t *testing.T) {
+	store := newFakeSecretStore()
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: false})
+	ctx := context.Background()
+
+	cred, _, err := manager.GenerateSSHKey(ctx, "owner-1", "My Key", "github.com")
+	require.NoError(t, err)
+	require.NoError(t, manager.Verify(ctx, &cred))
+
+	creds, err := manager.List(ctx, "owner-1")
+
+	require.NoError(t, err)
+	require.Len(t, creds, 1)
+	assert.Equal(t, gitmanager.CredentialStatusVerified, creds[0].Status)
+}
+
+func TestList_NoCredentialsForOwner_ReturnsEmptyNotError(t *testing.T) {
+	store := newFakeSecretStore()
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: false})
+
+	creds, err := manager.List(context.Background(), "owner-never-registered-anything")
+
+	require.NoError(t, err)
+	assert.Empty(t, creds)
 }

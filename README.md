@@ -40,6 +40,7 @@ See `specs/001-core-development-flows/contracts/websocket-protocol.md` in the co
 | `--workspace-dir` | `/var/lib/codeeditor/workspaces` | Root Workspaces are cloned into (local equivalent of the EFS mount) |
 | `--secrets-dir` | `/var/lib/codeeditor/secrets` | Root for `gitmanager.LocalFileStore` — self-hosted git credentials, no AWS |
 | `--mosh-udp-port-range` | `60000-61000` | UDP port range the `/handshake` checklist validates |
+| `--pairing-token-file` | `/etc/codeeditor/pairing-token` | Path to the bearer token every request must present (`Authorization: Bearer <token>`) — generated on first run if the file doesn't exist yet, see `internal/pairing` |
 
 ## Running locally
 
@@ -67,6 +68,14 @@ Target coverage: ≥90% on `internal/entitlements`, `internal/gitmanager`, and `
 go build -o bridged ./cmd/bridged
 ./bridged --port 8443 --tls-cert /etc/codeeditor/tls.crt --tls-key /etc/codeeditor/tls.key
 ```
+
+Every request `bridged` serves — `/handshake` included, there is no unauthenticated route — needs an `Authorization: Bearer <token>` header matching whatever's in `--pairing-token-file` (`internal/pairing.LoadOrCreateToken`). Nothing else validates *which device* is driving the daemon (the app trusting a self-hosted machine's self-signed TLS certificate makes completing the TLS handshake alone trivial for anyone reachable on the network), so this file is the only thing standing between "reachable" and "controllable" — Terminal shell access, the full filesystem, git credentials, arbitrary run/debug included. On first run, with no `--pairing-token-file` flag override, `bridged` generates a random 64-character token and writes it to `/etc/codeeditor/pairing-token` (`0600`, owner-only) — read it back to pair the app manually:
+
+```bash
+cat /etc/codeeditor/pairing-token
+```
+
+Paste that into the app's "Conectar tu servidor" form's "Token de emparejamiento" field. `RemoteSetupService.swift`'s guided setup (below) skips this step entirely — it generates the token itself over the same SSH session it uses to deploy everything else, and saves it straight to the app's Keychain, no manual copy/paste involved.
 
 Doing all of this by hand is exactly what `app/Sources/Features/RemoteSetup/RemoteSetupService.swift` automates over SSH from the app itself — it downloads a prebuilt binary instead of building one (`.github/workflows/release.yml` publishes `bridged-linux-{amd64,arm64}` as GitHub Release assets on every tag; this repo is public specifically so those assets are reachable with no credentials from a fresh host) and sets it up as a systemd service (falling back to a detached process if the host has no systemd). See that file's doc comment for the exact scope (apt-only, root/passwordless-sudo required).
 

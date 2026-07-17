@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -60,6 +61,14 @@ type Credential struct {
 type SecretStore interface {
 	Put(ctx context.Context, ref string, value string) error
 	Get(ctx context.Context, ref string) (string, error)
+	// List returns every ref beginning with prefix — used by
+	// CredentialManager.List to reconstruct which credentials already
+	// exist for an ownerUserID (FR-021's "indexadas por usuario" cuts
+	// both ways: it's also how a Host that already has credentials on it
+	// gets discovered again after the app that registered them loses its
+	// own local record, e.g. a reinstall). An empty result for a prefix
+	// that has no secrets under it is not an error.
+	List(ctx context.Context, prefix string) ([]string, error)
 }
 
 // Validator checks that a credential actually authenticates against its
@@ -81,6 +90,64 @@ func NewCredentialManager(secrets SecretStore, validator Validator) *CredentialM
 
 func (m *CredentialManager) secretRef(ownerUserID, credentialID string) string {
 	return fmt.Sprintf("codeeditor/git-credentials/%s/%s", ownerUserID, credentialID)
+}
+
+// metaRef is where a Credential's own metadata (everything but the secret
+// itself: alias, domain, kind, status, ...) lives — a sibling of its
+// secret under the same SecretStore, one level of indirection SecretStore
+// itself doesn't know about. Needed because SecretStore.Get(ref) only
+// ever returns the raw secret value: without this, List has no way to
+// reconstruct which alias/domain/kind/status a given secretRef belongs
+// to, and a Host that already has credentials on it (e.g. registered from
+// a device whose local SwiftData record is gone — a reinstall, a second
+// device) would stay invisible to List forever even though the secret
+// itself is right there.
+func (m *CredentialManager) metaRef(secretRef string) string {
+	return secretRef + ".meta.json"
+}
+
+// putMeta persists cred's own metadata alongside its secret. Best-effort,
+// same as the rest of this package's git-credentials writes tolerate a
+// storage hiccup without failing the whole registration: the credential
+// still works for this response either way, it would just stay invisible
+// to a future List call if this particular write fails while the secret
+// write right before it (which does fail the caller) succeeded.
+func (m *CredentialManager) putMeta(ctx context.Context, cred Credential) {
+	data, err := json.Marshal(cred)
+	if err != nil {
+		return
+	}
+	_ = m.secrets.Put(ctx, m.metaRef(cred.SecretRef), string(data))
+}
+
+// List reconstructs every Credential already registered for ownerUserID
+// by reading back the metadata List writes — see metaRef's doc comment
+// for why this can't just enumerate secrets directly. A metadata blob
+// that fails to read or parse (e.g. written by a future format this
+// version doesn't understand) is skipped rather than failing the whole
+// list — one bad entry shouldn't hide every other real credential.
+func (m *CredentialManager) List(ctx context.Context, ownerUserID string) ([]Credential, error) {
+	prefix := fmt.Sprintf("codeeditor/git-credentials/%s/", ownerUserID)
+	refs, err := m.secrets.List(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("gitmanager: list credentials: %w", err)
+	}
+	creds := make([]Credential, 0, len(refs))
+	for _, ref := range refs {
+		if !strings.HasSuffix(ref, ".meta.json") {
+			continue
+		}
+		data, err := m.secrets.Get(ctx, ref)
+		if err != nil {
+			continue
+		}
+		var cred Credential
+		if err := json.Unmarshal([]byte(data), &cred); err != nil {
+			continue
+		}
+		creds = append(creds, cred)
+	}
+	return creds, nil
 }
 
 // GenerateSSHKey creates a new ed25519 key pair, stores the private key,
@@ -181,7 +248,7 @@ func (m *CredentialManager) store(
 		return Credential{}, fmt.Errorf("gitmanager: store secret: %w", err)
 	}
 
-	return Credential{
+	cred := Credential{
 		ID:          id,
 		OwnerUserID: ownerUserID,
 		Alias:       alias,
@@ -189,7 +256,9 @@ func (m *CredentialManager) store(
 		Kind:        kind,
 		Status:      CredentialStatusVerified,
 		SecretRef:   ref,
-	}, nil
+	}
+	m.putMeta(ctx, cred)
+	return cred, nil
 }
 
 // storeGenerated is GenerateSSHKey's own persistence path — see its doc
@@ -205,7 +274,7 @@ func (m *CredentialManager) storeGenerated(
 		return Credential{}, fmt.Errorf("gitmanager: store secret: %w", err)
 	}
 
-	return Credential{
+	cred := Credential{
 		ID:          id,
 		OwnerUserID: ownerUserID,
 		Alias:       alias,
@@ -213,7 +282,9 @@ func (m *CredentialManager) storeGenerated(
 		Kind:        CredentialKindSSHKey,
 		Status:      CredentialStatusUnverified,
 		SecretRef:   ref,
-	}, nil
+	}
+	m.putMeta(ctx, cred)
+	return cred, nil
 }
 
 // Verify re-checks an already-stored credential's existing secret against
@@ -230,6 +301,7 @@ func (m *CredentialManager) Verify(ctx context.Context, cred *Credential) error 
 		return fmt.Errorf("gitmanager: verification failed: %w", err)
 	}
 	cred.Status = CredentialStatusVerified
+	m.putMeta(ctx, *cred)
 	return nil
 }
 
@@ -253,5 +325,6 @@ func (m *CredentialManager) Reauthenticate(ctx context.Context, cred *Credential
 		return fmt.Errorf("gitmanager: reauthentication failed validation: %w", err)
 	}
 	cred.Status = CredentialStatusVerified
+	m.putMeta(ctx, *cred)
 	return nil
 }

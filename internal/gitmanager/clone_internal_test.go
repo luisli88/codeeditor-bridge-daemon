@@ -1,9 +1,92 @@
 package gitmanager
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCloner_ListWorkspaceIDs_ReturnsOnlyDirsWithGitEntry(t *testing.T) {
+	baseDir := t.TempDir()
+	mustInitRepo(t, filepath.Join(baseDir, "ws-1"))
+	mustInitRepo(t, filepath.Join(baseDir, "ws-2"))
+	if err := os.MkdirAll(filepath.Join(baseDir, "not-a-clone"), 0o755); err != nil {
+		t.Fatalf("mkdir not-a-clone: %v", err)
+	}
+
+	ids, err := NewCloner(baseDir).ListWorkspaceIDs()
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	want := map[string]bool{"ws-1": true, "ws-2": true}
+	if len(ids) != len(want) {
+		t.Fatalf("expected %v, got %v", want, ids)
+	}
+	for _, id := range ids {
+		if !want[id] {
+			t.Errorf("unexpected workspaceID %q in result %v", id, ids)
+		}
+	}
+}
+
+func TestCloner_ListWorkspaceIDs_BaseDirMissing_ReturnsEmptyNotError(t *testing.T) {
+	ids, err := NewCloner(filepath.Join(t.TempDir(), "does-not-exist")).ListWorkspaceIDs()
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected no workspace ids, got %v", ids)
+	}
+}
+
+func TestCloner_RepositoryURL_ReturnsOriginRemote(t *testing.T) {
+	baseDir := t.TempDir()
+	workspacePath := filepath.Join(baseDir, "ws-1")
+	mustInitRepo(t, workspacePath)
+	mustRunGit(t, workspacePath, "remote", "add", "origin", "git@github.com:acme/repo.git")
+
+	url, err := NewCloner(baseDir).RepositoryURL(workspacePath)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if url != "git@github.com:acme/repo.git" {
+		t.Fatalf("expected origin remote url, got %q", url)
+	}
+}
+
+func TestCloner_RepositoryURL_NoOriginRemote_ReturnsError(t *testing.T) {
+	baseDir := t.TempDir()
+	workspacePath := filepath.Join(baseDir, "ws-1")
+	mustInitRepo(t, workspacePath)
+
+	_, err := NewCloner(baseDir).RepositoryURL(workspacePath)
+
+	if err == nil {
+		t.Fatal("expected an error for a repo with no origin remote")
+	}
+}
+
+func mustInitRepo(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %q: %v", dir, err)
+	}
+	mustRunGit(t, dir, "init", "--quiet")
+}
+
+func mustRunGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
 
 func TestAtoiSafe(t *testing.T) {
 	cases := map[string]int{"0": 0, "42": 42, "1234": 1234, "": 0, "12a": 12}

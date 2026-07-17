@@ -70,6 +70,53 @@ func (c *Cloner) WorkspacePath(workspaceID string) string {
 	return filepath.Join(c.baseDir, workspaceID)
 }
 
+// ListWorkspaceIDs returns every workspaceID that has a real clone on
+// disk under baseDir — used to reconstruct which Projects already exist
+// on this Host (`devpod.Lister`) when the client asking has no local
+// record of them at all (a reinstall, a second device). A directory
+// without a `.git` entry is skipped rather than reported: it's not a
+// clone (a leftover from a failed `Clone` that never reached `git init`,
+// or something unrelated entirely), and a bare `os.ReadDir` on baseDir
+// not existing yet (a fresh Host, nothing cloned ever) returns an empty
+// result rather than an error.
+func (c *Cloner) ListWorkspaceIDs() ([]string, error) {
+	entries, err := os.ReadDir(c.baseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("gitmanager: list workspaces under %q: %w", c.baseDir, err)
+	}
+	var ids []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(c.baseDir, entry.Name(), ".git")); err != nil {
+			continue
+		}
+		ids = append(ids, entry.Name())
+	}
+	return ids, nil
+}
+
+// RepositoryURL reads workspacePath's own `origin` remote — the clone
+// itself is the only record of which repository it came from (Cloner
+// never persists that separately), so reconstructing a Project's
+// repositoryUrl after the client's own local record of it is gone means
+// asking the clone directly. `-c safe.directory=` for the same reason
+// Operations.run needs it: `devpod up` chowns this same directory to the
+// devcontainer's internal user, and git refuses to operate on a
+// repository it doesn't own unless explicitly allowlisted.
+func (c *Cloner) RepositoryURL(workspacePath string) (string, error) {
+	cmd := exec.Command("git", "-c", "safe.directory="+workspacePath, "-C", workspacePath, "remote", "get-url", "origin")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gitmanager: read origin remote for %q: %w", workspacePath, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // Clone runs `git clone --progress`, streaming parsed progress to
 // reporter. The credential (if any) is passed via a short-lived
 // environment/temp-file, never as a URL or argv component — both of

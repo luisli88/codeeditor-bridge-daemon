@@ -141,6 +141,56 @@ exit 0
 	}
 }
 
+func TestSubprocessRunner_List_ParsesWorkspaceIDsFromLocalFolderBasename(t *testing.T) {
+	// Real shape confirmed against `docker exec fake-remote-host devpod
+	// list --output json`: `id` is lowercased by devpod internally, but
+	// `source.localFolder`'s basename preserves the original
+	// (client-generated, mixed-case) workspaceID — the one Cloner and the
+	// rest of this package actually use.
+	fakeDevpodScript(t, `
+if [ "$1" = "list" ] && [ "$2" = "--output" ] && [ "$3" = "json" ]; then
+  cat <<'JSON'
+[{"id":"16861e4b-f021-4b46-8bc0-daf7eed45b83","source":{"localFolder":"/var/lib/codeeditor/workspaces/16861E4B-F021-4B46-8BC0-DAF7EED45B83"}}]
+JSON
+  exit 0
+fi
+exit 1
+`)
+
+	ids, err := SubprocessRunner{}.List(context.Background())
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	want := []string{"16861E4B-F021-4B46-8BC0-DAF7EED45B83"}
+	if len(ids) != len(want) || ids[0] != want[0] {
+		t.Fatalf("expected %v, got %v", want, ids)
+	}
+}
+
+func TestSubprocessRunner_List_NoWorkspaces_ReturnsEmpty(t *testing.T) {
+	fakeDevpodScript(t, `echo '[]'; exit 0`)
+
+	ids, err := SubprocessRunner{}.List(context.Background())
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected no workspace ids, got %v", ids)
+	}
+}
+
+func TestSubprocessRunner_List_CommandFails_ReturnsError(t *testing.T) {
+	fakeDevpodScript(t, `echo "boom" 1>&2; exit 1`)
+
+	_, err := SubprocessRunner{}.List(context.Background())
+
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
 func TestSubprocessRunner_Delete_FailsWithFatalLine_UsesItsMessage(t *testing.T) {
 	fakeDevpodScript(t, `
 echo '{"level":"fatal","message":"workspace ws-1 is busy"}'

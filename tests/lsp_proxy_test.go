@@ -33,6 +33,24 @@ func trueCommand(languageID string) (string, []string, error) {
 	return "true", nil, nil
 }
 
+// echoOneThenDieCommand reads exactly one Content-Length-framed message,
+// echoes it back framed the same way, then exits — a process that answers
+// its own replayed `initialize` (so `LSPProxy.replayHandshake` doesn't
+// block for its full 30s timeout waiting for a reply that never comes,
+// the way it would against `trueCommand`/a process that never reads
+// anything) before dying, same as a real Language Server crashing right
+// after finishing its handshake.
+func echoOneThenDieCommand(languageID string) (string, []string, error) {
+	script := `
+IFS= read -r header
+len=$(printf '%s' "$header" | tr -d '\r' | sed 's/^Content-Length: //')
+IFS= read -r blank
+body=$(dd bs=1 count="$len" 2>/dev/null)
+printf 'Content-Length: %s\r\n\r\n%s' "$len" "$body"
+`
+	return "sh", []string{"-c", script}, nil
+}
+
 func TestLSPProxy_DidOpen_RoutesAndEchoesThroughRealFraming(t *testing.T) {
 	fakeDevpodSSHScript(t)
 	var installedLanguages []string
@@ -216,6 +234,148 @@ func TestLSPProxy_Initialize_BeforeAnyDidOpen_SucceedsSynthetically(t *testing.T
 		}
 	}
 	t.Fatalf("didOpen echo never arrived; last message: %s", didOpenResp.Payload)
+}
+
+// Regression test for the "autocompletar dejó de funcionar de repente"
+// symptom: a Language Server that dies mid-session (confirmed live: real
+// memory pressure from other processes in the same devcontainer, e.g.
+// `claude` running heavy in the Terminal) gets a fresh replacement on the
+// next request — but before this fix, that replacement had never heard of
+// any file the Desarrollador already had open (only `initialize`/
+// `initialized` were replayed, never `didOpen`), so completion against an
+// already-open file silently resolved nothing, forever, with no error
+// either. This drives a real respawn (`echoOneThenDieCommand` — answers
+// its own replayed `initialize` so `replayHandshake` doesn't block for
+// its full 30s timeout, then dies, same as a real Language Server
+// crashing right after finishing its handshake) followed by a real
+// long-lived one (`cat`, echoes everything) and confirms the already-open
+// document's `didOpen` reaches the second process before the request
+// that triggered the respawn does.
+func TestLSPProxy_ServerRespawnsAfterDeath_ReplaysAlreadyOpenDocuments(t *testing.T) {
+	fakeDevpodSSHScript(t)
+	var mu sync.Mutex
+	spawnCount := 0
+	command := func(languageID string) (string, []string, error) {
+		mu.Lock()
+		spawnCount++
+		count := spawnCount
+		mu.Unlock()
+		if count == 1 {
+			return echoOneThenDieCommand(languageID)
+		}
+		return catCommand(languageID)
+	}
+	proxy := ws.NewLSPProxy(command, func(ctx context.Context, workspaceID, languageID string) error { return nil })
+	srv := ws.NewServer()
+	srv.Handle(ws.ChannelLSP, proxy.Handler())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	workspaceID := "ws-1"
+
+	c, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	defer c.CloseNow() //nolint:errcheck
+
+	initialize, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"processId": nil, "rootUri": nil, "capabilities": map[string]any{}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-init", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: initialize,
+	}))
+	var initResp ws.Envelope
+	require.NoError(t, wsjson.Read(ctx, c, &initResp))
+	require.Nil(t, initResp.Error)
+
+	didOpen, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "textDocument/didOpen",
+		"params": map[string]any{"textDocument": map[string]any{"languageId": "go", "uri": "file:///already-open.go"}},
+	})
+	require.NoError(t, err)
+	// The first spawn answers the replayed `initialize` (unblocking
+	// `replayHandshake` immediately) and then dies — this didOpen itself
+	// arrives at an already-dead pipe and gets a `lsp-write-failed` back
+	// (unread here, harmless), but must still be recorded into
+	// `openDocuments` before that failed write, same as any other didOpen.
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-open", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: didOpen,
+	}))
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return spawnCount == 1
+	}, 5*time.Second, 20*time.Millisecond, "the first didOpen should have spawned a server")
+
+	// Not a didOpen — a completion request against the *same* already-open
+	// file, same as what a real respawn is actually triggered by (the
+	// Desarrollador keeps typing in a file they never re-opened).
+	completion, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+		"params": map[string]any{
+			"textDocument": map[string]any{"uri": "file:///already-open.go"},
+			"position":     map[string]any{"line": 0, "character": 0},
+		},
+	})
+	require.NoError(t, err)
+
+	// Only the *write* side retries here — `pump` noticing the dead
+	// process and evicting it races with this test, so resending until it
+	// lands after eviction is what actually waits out that race, same
+	// reasoning as TestLSPProxy_ServerProcessDies_.... Reading is
+	// deliberately *not* retried with a fresh short-lived context per
+	// attempt: `coder/websocket`'s Read closes the *entire connection* the
+	// moment its own context expires (confirmed by reading its source,
+	// `conn.go`'s `setupReadTimeout`/`context.AfterFunc(ctx, ... c.close
+	// ...)`) — a real "message not here yet, try again" case would
+	// otherwise permanently kill the connection on the very first
+	// spurious timeout.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		count := spawnCount
+		mu.Unlock()
+		if count >= 2 {
+			return true
+		}
+		_ = wsjson.Write(ctx, c, ws.Envelope{
+			ID: "req-completion", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: completion,
+		})
+		return false
+	}, 10*time.Second, 100*time.Millisecond, "the completion request should eventually respawn instead of reusing the dead server")
+
+	// The write that actually triggered the respawn above (the last one
+	// before spawnCount flipped to 2) may have landed on the dead handle,
+	// not the live one — send it once more now that the respawn is
+	// confirmed, so the *new* server definitely receives it.
+	require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+		ID: "req-completion-2", Channel: ws.ChannelLSP, WorkspaceID: &workspaceID, Payload: completion,
+	}))
+
+	readCtx, readCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer readCancel()
+	var sawReplayedDidOpen, sawCompletion bool
+	for !sawCompletion {
+		var resp ws.Envelope
+		if err := wsjson.Read(readCtx, c, &resp); err != nil {
+			break
+		}
+		if resp.Error != nil {
+			continue
+		}
+		text := string(resp.Payload)
+		if strings.Contains(text, "already-open.go") && strings.Contains(text, "didOpen") {
+			sawReplayedDidOpen = true
+		}
+		if strings.Contains(text, `"id":2`) {
+			sawCompletion = true
+		}
+	}
+	require.True(t, sawReplayedDidOpen, "expected the respawned server to receive the already-open document's replayed didOpen")
+	require.True(t, sawCompletion, "expected the completion request that triggered the respawn to still go through")
 }
 
 func TestLSPProxy_NoWorkspaceID_ReturnsError(t *testing.T) {

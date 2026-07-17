@@ -142,6 +142,78 @@ func TestShellSessions_SecondConnectionAfterFirstCloses_StillReceivesOutput(t *t
 	}, 8*time.Second, 100*time.Millisecond, "expected the second connection to receive PTY output after the first one closed")
 }
 
+// A new viewer taking over an already-attached tmux session (app
+// relaunch, a dropped/reconnected socket, a second device) must see the
+// screen that's already there, not just whatever new output happens next
+// — see `refreshTmuxClient`'s doc comment for the real symptom this was
+// found live: a Terminal that looked permanently blank/stuck after any
+// reconnect, until the Desarrollador typed something blind. This connects
+// only with a payload-less "attach" Envelope (never anything that would
+// itself produce output) and still expects to see content the *first*
+// connection already printed before it disconnected.
+func TestShellSessions_SecondViewer_GetsFullRepaintWithoutTypingAnything(t *testing.T) {
+	fakeDevpodSSHScript(t)
+	sessions := session.NewShellSessions(newTmuxSessionName(t))
+	srv := ws.NewServer()
+	srv.Handle(ws.ChannelShell, sessions.Handler())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	workspaceID := "ws-1"
+
+	send := func(c *websocket.Conn, command string) {
+		payload, err := json.Marshal(map[string]string{"data": base64.StdEncoding.EncodeToString([]byte(command))})
+		require.NoError(t, err)
+		require.NoError(t, wsjson.Write(ctx, c, ws.Envelope{
+			ID: "req", Channel: ws.ChannelShell, WorkspaceID: &workspaceID, Payload: payload,
+		}))
+	}
+
+	first, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	send(first, "echo ALREADY_ON_SCREEN\n")
+	require.Eventually(t, func() bool {
+		readCtx, readCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer readCancel()
+		var env ws.Envelope
+		return wsjson.Read(readCtx, first, &env) == nil
+	}, 8*time.Second, 100*time.Millisecond, "expected the first connection to see at least one reply before disconnecting")
+	require.NoError(t, first.CloseNow())
+
+	second, _, err := websocket.Dial(ctx, url, nil)
+	require.NoError(t, err)
+	defer second.CloseNow() //nolint:errcheck
+	require.NoError(t, wsjson.Write(ctx, second, ws.Envelope{
+		ID: "attach", Channel: ws.ChannelShell, WorkspaceID: &workspaceID,
+	}))
+
+	var sawAlreadyOnScreen bool
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && !sawAlreadyOnScreen {
+		readCtx, readCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		var env ws.Envelope
+		err := wsjson.Read(readCtx, second, &env)
+		readCancel()
+		if err != nil {
+			continue
+		}
+		var shellPayload struct {
+			Data string `json:"data"`
+		}
+		if json.Unmarshal(env.Payload, &shellPayload) != nil {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(shellPayload.Data)
+		if err == nil && strings.Contains(string(raw), "ALREADY_ON_SCREEN") {
+			sawAlreadyOnScreen = true
+		}
+	}
+	require.True(t, sawAlreadyOnScreen, "a new viewer attaching to an already-running tmux session must get a full repaint, not just future output")
+}
+
 // The claude-auth output watcher taps the same PTY stream without
 // disrupting the shell channel's own relay.
 func TestShellSessions_OutputWatcher_SeesSameBytesAsShellChannel(t *testing.T) {

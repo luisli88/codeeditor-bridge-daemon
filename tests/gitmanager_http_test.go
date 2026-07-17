@@ -35,6 +35,10 @@ func (failingSecretStore) Get(ctx context.Context, ref string) (string, error) {
 	return "", errors.New("secret store unavailable")
 }
 
+func (failingSecretStore) List(ctx context.Context, prefix string) ([]string, error) {
+	return nil, errors.New("secret store unavailable")
+}
+
 func newFailingStoreTestMux() *http.ServeMux {
 	manager := gitmanager.NewCredentialManager(failingSecretStore{}, &fakeValidator{shouldFail: false})
 	mux := http.NewServeMux()
@@ -304,4 +308,58 @@ func TestReauthenticateHandler_InvalidBody_ReturnsBadRequest(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func getPath(t *testing.T, mux *http.ServeMux, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+// Regression coverage for the reconciliation gap this endpoint exists to
+// close: reconnecting to a Host that already has credentials on it (this
+// device before a reinstall, or a different device) must actually surface
+// them, not just the ones registered in *this* test/session.
+func TestListCredentialsHandler_ReturnsOnlyThatOwnersCredentials(t *testing.T) {
+	mux, _ := newTestMux()
+	postJSON(t, mux, "/git-credentials/pat", map[string]string{
+		"ownerUserId": "owner-1", "alias": "GitHub Token", "domain": "github.com", "token": "ghp_token",
+	})
+	postJSON(t, mux, "/git-credentials/pat", map[string]string{
+		"ownerUserId": "owner-2", "alias": "Someone Else's Token", "domain": "github.com", "token": "ghp_other",
+	})
+
+	rec := getPath(t, mux, "/git-credentials?ownerUserId=owner-1")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Credentials []gitmanager.Credential `json:"credentials"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Credentials, 1)
+	require.Equal(t, "GitHub Token", resp.Credentials[0].Alias)
+	require.Equal(t, "owner-1", resp.Credentials[0].OwnerUserID)
+}
+
+func TestListCredentialsHandler_MissingOwnerUserId_ReturnsBadRequest(t *testing.T) {
+	mux, _ := newTestMux()
+
+	rec := getPath(t, mux, "/git-credentials")
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestListCredentialsHandler_NoCredentialsForOwner_ReturnsEmptyList(t *testing.T) {
+	mux, _ := newTestMux()
+
+	rec := getPath(t, mux, "/git-credentials?ownerUserId=never-registered-anything")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Credentials []gitmanager.Credential `json:"credentials"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Empty(t, resp.Credentials)
 }

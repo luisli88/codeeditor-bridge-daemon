@@ -97,6 +97,8 @@ func (s *ShellSessions) Handler() ws.Handler {
 		// attached (`isNew` false below), and `pump`'s goroutine — still
 		// alive, still reading the same tmux session — needs to notice.
 		s.mu.Lock()
+		previous, hadActive := s.active[workspaceID]
+		isNewViewer := !hadActive || previous.conn != conn
 		s.active[workspaceID] = activeConnection{ctx: ctx, conn: conn}
 		s.mu.Unlock()
 
@@ -107,6 +109,25 @@ func (s *ShellSessions) Handler() ws.Handler {
 		}
 		if isNew {
 			go s.pump(workspaceID, ptmx)
+		} else if isNewViewer {
+			// This Workspace's tmux session is already attached — reused
+			// as-is (this whole type's own point: attaching fresh on
+			// every keystroke would be wrong and slow) — but a *different*
+			// WebSocket connection just started relaying for it (app
+			// relaunch, a dropped/reconnected socket, a second device).
+			// tmux only ever repaints its screen for a client it thinks
+			// just attached; it has no idea the other end of this
+			// redirection just changed, so it silently kept streaming
+			// only *new* output (confirmed live: the status bar's own
+			// once-a-second clock tick reached a fresh viewer just fine,
+			// but the pane content already on screen — the prompt,
+			// anything printed before this viewer connected — never did,
+			// indefinitely, until the Desarrollador typed something
+			// blind and *that* counted as new output). `refresh-client`
+			// forces tmux to repaint for the one real OS-level client
+			// this type keeps attached, which is exactly the redirection
+			// target that just changed.
+			go refreshTmuxClient(workspaceID, s.name(workspaceID))
 		}
 
 		if env.Payload == nil {
@@ -161,6 +182,18 @@ func (s *ShellSessions) attach(workspaceID string) (*os.File, bool, error) {
 	}
 	s.attached[workspaceID] = ptmx
 	return ptmx, true, nil
+}
+
+// refreshTmuxClient forces a full-screen repaint for workspaceID's already-
+// attached OS-level tmux client (`ShellSessions.attach`'s cached ptmx) — see
+// the call site in `Handler` for why this is needed at all. Best-effort:
+// nothing meaningful to do with an error here (no Envelope/conn to report
+// one on — this runs detached, after `Handler` already returned), and a
+// failed refresh just leaves the Desarrollador looking at a stale screen
+// until real new output happens to arrive, same as before this existed.
+func refreshTmuxClient(workspaceID, sessionName string) {
+	cmd := devpodexec.ShellJoin([]string{"tmux", "refresh-client", "-t", sessionName})
+	_ = exec.Command("devpod", "ssh", workspaceID, "--command", cmd).Run()
 }
 
 // ensureTmuxInstalled installs tmux inside workspaceID's devpod Workspace

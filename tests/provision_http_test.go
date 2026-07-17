@@ -17,10 +17,25 @@ import (
 func newProvisionTestMux(fakes *provisionerFakes) *http.ServeMux {
 	gate := entitlements.NewGate(allowAllStore{})
 	provisioner := newProvisioner(gate, fakes)
+	lister := devpod.NewLister(
+		func(workspaceID string) string { return workspaceID },
+		func() ([]string, error) { return nil, nil },
+		func(string) (string, error) { return "", nil },
+		fakeListRunner{},
+	)
 	mux := http.NewServeMux()
-	devpod.RegisterRoutes(mux, provisioner)
+	devpod.RegisterRoutes(mux, provisioner, lister)
 	return mux
 }
+
+// fakeListRunner satisfies devpod.Runner for tests that need a Lister
+// wired up but aren't themselves testing devpod-up status — ids is
+// returned verbatim by List.
+type fakeListRunner struct{ ids []string }
+
+func (fakeListRunner) Up(context.Context, string, func(string)) error { return nil }
+func (fakeListRunner) Delete(context.Context, string) error           { return nil }
+func (r fakeListRunner) List(context.Context) ([]string, error)       { return r.ids, nil }
 
 func TestProvisionHandler_AllStepsSucceed_ReturnsReady(t *testing.T) {
 	mux := newProvisionTestMux(&provisionerFakes{})

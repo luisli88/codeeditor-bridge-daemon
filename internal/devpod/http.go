@@ -5,15 +5,16 @@ import (
 	"net/http"
 )
 
-// RegisterRoutes wires Provisioner onto mux. Like gitmanager's HTTP
-// surface, this is stateless across requests: RetryStep's request carries
-// the full prior Result back (the app already persists it locally via
-// ProjectRepository), so the Bridge Daemon never needs to remember
+// RegisterRoutes wires Provisioner and Lister onto mux. Like gitmanager's
+// HTTP surface, this is stateless across requests: RetryStep's request
+// carries the full prior Result back (the app already persists it locally
+// via ProjectRepository), so the Bridge Daemon never needs to remember
 // in-flight provisioning state itself.
-func RegisterRoutes(mux *http.ServeMux, provisioner *Provisioner) {
+func RegisterRoutes(mux *http.ServeMux, provisioner *Provisioner, lister *Lister) {
 	mux.HandleFunc("POST /projects/provision", provisionHandler(provisioner))
 	mux.HandleFunc("POST /projects/retry-step", retryStepHandler(provisioner))
 	mux.HandleFunc("POST /projects/deprovision", deprovisionHandler(provisioner))
+	mux.HandleFunc("GET /projects", listProjectsHandler(lister))
 }
 
 func provisionHandler(provisioner *Provisioner) http.HandlerFunc {
@@ -67,6 +68,26 @@ func deprovisionHandler(provisioner *Provisioner) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// listProjectsHandler answers `GET /projects` — reconstructs which
+// Projects already exist on this Host so a client whose own local record
+// of them is gone (a reinstall, a second device) can discover them again.
+// No owner-scoping query param, unlike GET /git-credentials: self-hosted
+// has exactly one implicit owner per Host, and Lister has no notion of
+// ownership to filter by in the first place (see Lister's own doc
+// comment on what it can and can't recover).
+func listProjectsHandler(lister *Lister) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		projects, err := lister.List(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, struct {
+			Projects []ProjectInfo `json:"projects"`
+		}{Projects: projects})
 	}
 }
 

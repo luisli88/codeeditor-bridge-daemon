@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -22,6 +23,9 @@ type SecretsManagerAPI interface {
 	GetSecretValue(
 		ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options),
 	) (*secretsmanager.GetSecretValueOutput, error)
+	ListSecrets(
+		ctx context.Context, params *secretsmanager.ListSecretsInput, optFns ...func(*secretsmanager.Options),
+	) (*secretsmanager.ListSecretsOutput, error)
 }
 
 // SecretsManagerStore is the production SecretStore
@@ -65,4 +69,34 @@ func (s *SecretsManagerStore) Get(ctx context.Context, ref string) (string, erro
 		return "", fmt.Errorf("secretsmanager: secret %s has no string value", ref)
 	}
 	return *out.SecretString, nil
+}
+
+// List returns every secret name under prefix. Secrets Manager's "name"
+// filter is a real (case-sensitive) prefix match server-side, but results
+// are re-checked with strings.HasPrefix anyway — "prefix match" in the
+// filter's own docs isn't specified precisely enough to trust blindly
+// against an adversarial or merely coincidental name, and the recheck
+// costs nothing.
+func (s *SecretsManagerStore) List(ctx context.Context, prefix string) ([]string, error) {
+	var refs []string
+	var nextToken *string
+	for {
+		out, err := s.Client.ListSecrets(ctx, &secretsmanager.ListSecretsInput{
+			Filters:   []types.Filter{{Key: types.FilterNameStringTypeName, Values: []string{prefix}}},
+			NextToken: nextToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("secretsmanager ListSecrets %s: %w", prefix, err)
+		}
+		for _, secret := range out.SecretList {
+			if secret.Name != nil && strings.HasPrefix(*secret.Name, prefix) {
+				refs = append(refs, *secret.Name)
+			}
+		}
+		if out.NextToken == nil {
+			break
+		}
+		nextToken = out.NextToken
+	}
+	return refs, nil
 }
