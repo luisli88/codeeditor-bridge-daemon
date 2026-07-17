@@ -2,6 +2,7 @@ package devpod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/bootstrap"
@@ -128,6 +129,13 @@ type (
 	// SecretRef (FR-021), never the secret itself, so Provisioner must
 	// resolve it server-side right before the clone step needs it.
 	ResolveSecretFunc func(ctx context.Context, secretRef string) (string, error)
+	// DevPodDeleteFunc takes workspaceID, not workspacePath, for the same
+	// reason as LSPInstallFunc/ClaudeInstallFunc: devpod addresses a
+	// Workspace by ID, not by its host-side clone path.
+	DevPodDeleteFunc func(ctx context.Context, workspaceID string) error
+	// DeleteClonePathFunc removes the cloned repository at workspacePath
+	// (gitmanager.Cloner.WorkspacePath) from disk.
+	DeleteClonePathFunc func(workspacePath string) error
 )
 
 // Provisioner runs FR-027's sequence and FR-028's per-step retry. Every
@@ -144,6 +152,8 @@ type Provisioner struct {
 	devPodUp      DevPodUpFunc
 	installLSP    LSPInstallFunc
 	installClaude ClaudeInstallFunc
+	devPodDelete  DevPodDeleteFunc
+	deleteClone   DeleteClonePathFunc
 }
 
 // NewProvisioner builds a Provisioner. Every func parameter is required;
@@ -158,11 +168,33 @@ func NewProvisioner(
 	devPodUp DevPodUpFunc,
 	installLSP LSPInstallFunc,
 	installClaude ClaudeInstallFunc,
+	devPodDelete DevPodDeleteFunc,
+	deleteClone DeleteClonePathFunc,
 ) *Provisioner {
 	return &Provisioner{
 		gate: gate, workspacePath: workspacePath, clone: clone, resolveSecret: resolveSecret, devcontainer: devcontainer,
 		languagesOf: languagesOf, devPodUp: devPodUp, installLSP: installLSP, installClaude: installClaude,
+		devPodDelete: devPodDelete, deleteClone: deleteClone,
 	}
+}
+
+// Deprovision tears down everything Provision built for workspaceID: the
+// devpod-managed container/infrastructure and the cloned repository on
+// disk. Called when the Desarrollador deletes a Project — the app removes
+// its own local record regardless of whether this succeeds (see the App
+// side's ProjectListViewModel.confirmDeletion), so this runs both
+// teardown steps and joins their errors instead of stopping at the first
+// one: a failure deleting the devpod workspace shouldn't skip removing
+// the clone, and vice versa.
+func (p *Provisioner) Deprovision(ctx context.Context, workspaceID string) error {
+	var errs []error
+	if err := p.devPodDelete(ctx, workspaceID); err != nil {
+		errs = append(errs, fmt.Errorf("delete devpod workspace: %w", err))
+	}
+	if err := p.deleteClone(p.workspacePath(workspaceID)); err != nil {
+		errs = append(errs, fmt.Errorf("delete cloned repository: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 // Provision runs every step in order, stopping at the first failure —

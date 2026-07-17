@@ -13,6 +13,7 @@ import (
 func RegisterRoutes(mux *http.ServeMux, provisioner *Provisioner) {
 	mux.HandleFunc("POST /projects/provision", provisionHandler(provisioner))
 	mux.HandleFunc("POST /projects/retry-step", retryStepHandler(provisioner))
+	mux.HandleFunc("POST /projects/deprovision", deprovisionHandler(provisioner))
 }
 
 func provisionHandler(provisioner *Provisioner) http.HandlerFunc {
@@ -41,6 +42,31 @@ func retryStepHandler(provisioner *Provisioner) http.HandlerFunc {
 		result := body.Result
 		provisioner.RetryStep(r.Context(), body.Request, &result, body.Step)
 		writeJSON(w, &result)
+	}
+}
+
+// deprovisionHandler backs the App's "Eliminar" swipe on a Project
+// (BridgeProvisioningService.deprovision) — tears down the devpod
+// workspace and removes the cloned repository. Best-effort from the
+// caller's side (the App deletes its own local record regardless of the
+// outcome here, see ProjectListViewModel.confirmDeletion's doc comment),
+// but this still reports a real error when both teardown steps fail, so a
+// completely unreachable Bridge Daemon isn't silently treated the same as
+// a clean deprovision.
+func deprovisionHandler(provisioner *Provisioner) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			WorkspaceID string `json:"workspaceId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if err := provisioner.Deprovision(r.Context(), body.WorkspaceID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	}
 }
 

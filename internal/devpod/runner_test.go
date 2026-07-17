@@ -117,3 +117,44 @@ exit 0
 	}
 }
 
+func TestSubprocessRunner_Delete_Succeeds_CallsDevpodDeleteWithForceAndIgnoreNotFound(t *testing.T) {
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	fakeDevpodScript(t, fmt.Sprintf(`
+echo "$@" >> %s
+exit 0
+`, callsPath))
+
+	err := SubprocessRunner{}.Delete(context.Background(), "ws-1")
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	calls, readErr := os.ReadFile(callsPath)
+	if readErr != nil {
+		t.Fatalf("read calls log: %v", readErr)
+	}
+	log := string(calls)
+	for _, want := range []string{"delete ws-1", "--force", "--ignore-not-found"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("expected devpod to have been called with %q, call log was:\n%s", want, log)
+		}
+	}
+}
+
+func TestSubprocessRunner_Delete_FailsWithFatalLine_UsesItsMessage(t *testing.T) {
+	fakeDevpodScript(t, `
+echo '{"level":"fatal","message":"workspace ws-1 is busy"}'
+exit 1
+`)
+
+	err := SubprocessRunner{}.Delete(context.Background(), "ws-1")
+
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	wantSubstring := "workspace ws-1 is busy"
+	if !strings.Contains(err.Error(), wantSubstring) {
+		t.Fatalf("expected error to contain %q, got %q", wantSubstring, err.Error())
+	}
+}
+

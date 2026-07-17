@@ -79,3 +79,32 @@ func TestRetryStepHandler_RetriesOnlyRequestedStep(t *testing.T) {
 	require.Equal(t, 1, fakes.cloneCalls, "retry must not re-clone")
 	require.Equal(t, 2, fakes.devPodUpCalls)
 }
+
+func TestDeprovisionHandler_Succeeds_ReturnsOK(t *testing.T) {
+	fakes := &provisionerFakes{}
+	mux := newProvisionTestMux(fakes)
+
+	body, err := json.Marshal(map[string]string{"workspaceId": "ws-1"})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/projects/deprovision", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, fakes.devPodDeleteCalls)
+	require.Equal(t, "ws-1", fakes.devPodDeleteWorkspace)
+	require.Equal(t, 1, fakes.deleteCloneCalls)
+}
+
+func TestDeprovisionHandler_TeardownFails_ReturnsServerError(t *testing.T) {
+	fakes := &provisionerFakes{devPodDeleteShouldFail: true, deleteCloneShouldFail: true}
+	mux := newProvisionTestMux(fakes)
+
+	body, err := json.Marshal(map[string]string{"workspaceId": "ws-1"})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/projects/deprovision", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+}

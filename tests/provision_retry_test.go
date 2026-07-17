@@ -34,11 +34,17 @@ func (denyStore) CountActiveProjects(ctx context.Context, userID string) (int, e
 }
 
 type provisionerFakes struct {
-	cloneCalls         int
-	cloneShouldFail    bool
-	devcontainerCalls  int
-	devPodUpCalls      int
-	devPodUpShouldFail bool
+	cloneCalls             int
+	cloneShouldFail        bool
+	devcontainerCalls      int
+	devPodUpCalls          int
+	devPodUpShouldFail     bool
+	devPodDeleteCalls      int
+	devPodDeleteWorkspace  string
+	devPodDeleteShouldFail bool
+	deleteCloneCalls       int
+	deleteClonePath        string
+	deleteCloneShouldFail  bool
 }
 
 func newProvisioner(gate *entitlements.Gate, fakes *provisionerFakes) *devpod.Provisioner {
@@ -75,6 +81,22 @@ func newProvisioner(gate *entitlements.Gate, fakes *provisionerFakes) *devpod.Pr
 			return servers
 		},
 		func(ctx context.Context, workspaceID string) error { return nil },
+		func(ctx context.Context, workspaceID string) error {
+			fakes.devPodDeleteCalls++
+			fakes.devPodDeleteWorkspace = workspaceID
+			if fakes.devPodDeleteShouldFail {
+				return errors.New("devpod delete failed")
+			}
+			return nil
+		},
+		func(workspacePath string) error {
+			fakes.deleteCloneCalls++
+			fakes.deleteClonePath = workspacePath
+			if fakes.deleteCloneShouldFail {
+				return errors.New("delete clone failed")
+			}
+			return nil
+		},
 	)
 }
 
@@ -198,4 +220,32 @@ func TestRetryStep_Succeeds_ClearsThePreviousError(t *testing.T) {
 		}
 	}
 	assert.Nil(t, devPodStep.Error)
+}
+
+func TestDeprovision_DeletesDevPodWorkspaceAndClonedRepository(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{}
+	p := newProvisioner(gate, fakes)
+
+	err := p.Deprovision(context.Background(), "ws-1")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, fakes.devPodDeleteCalls)
+	assert.Equal(t, "ws-1", fakes.devPodDeleteWorkspace)
+	assert.Equal(t, 1, fakes.deleteCloneCalls)
+	assert.Equal(t, "/efs/ws-1", fakes.deleteClonePath)
+}
+
+// Both teardown steps must run even if one fails — a container that
+// won't delete shouldn't leave the clone on disk, and vice versa.
+func TestDeprovision_OneStepFails_StillRunsTheOtherAndReportsTheError(t *testing.T) {
+	gate := entitlements.NewGate(allowAllStore{})
+	fakes := &provisionerFakes{devPodDeleteShouldFail: true}
+	p := newProvisioner(gate, fakes)
+
+	err := p.Deprovision(context.Background(), "ws-1")
+
+	require.Error(t, err)
+	assert.Equal(t, 1, fakes.devPodDeleteCalls)
+	assert.Equal(t, 1, fakes.deleteCloneCalls, "must still delete the clone even though devpod delete failed")
 }

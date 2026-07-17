@@ -21,6 +21,7 @@ import (
 // production implementation.
 type Runner interface {
 	Up(ctx context.Context, workspacePath string, onEvent func(line string)) error
+	Delete(ctx context.Context, workspaceID string) error
 }
 
 // devpodLogLine is one `--log-output json` line — devpod's own schema
@@ -52,6 +53,20 @@ func (SubprocessRunner) Up(ctx context.Context, workspacePath string, onEvent fu
 	// both depend on.
 	if err := runDevpodCommand(ctx, onEvent, "up", workspacePath, "--log-output", "json", "--ide", "none"); err != nil {
 		return fmt.Errorf("devpod up: %w", err)
+	}
+	return nil
+}
+
+// Delete tears down workspaceID's devpod-managed container/infrastructure
+// (Deprovision's counterpart to Up) — called when the Desarrollador
+// deletes a Project. `--ignore-not-found` makes this idempotent: a
+// container that's already gone (crashed, manually removed, a previous
+// deprovision attempt that partly succeeded) is treated as a successful
+// delete rather than an error, since the end state either way is "nothing
+// left to clean up".
+func (SubprocessRunner) Delete(ctx context.Context, workspaceID string) error {
+	if err := runDevpodCommand(ctx, nil, "delete", workspaceID, "--force", "--ignore-not-found"); err != nil {
+		return fmt.Errorf("devpod delete: %w", err)
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/luisli88/codeeditor-bridge-daemon/internal/bootstrap"
@@ -82,6 +83,8 @@ func wireProvisioning(mux *http.ServeMux, cloner *gitmanager.Cloner, secretStore
 		devPodUpFunc,
 		lspInstallFunc,
 		claudeInstallFunc,
+		devPodDeleteFunc,
+		os.RemoveAll,
 	)
 	devpod.RegisterRoutes(mux, provisioner)
 }
@@ -145,6 +148,10 @@ func devcontainerFunc(workspacePath string) (map[string]any, error) {
 
 func devPodUpFunc(ctx context.Context, workspacePath string) error {
 	return devpod.SubprocessRunner{}.Up(ctx, workspacePath, func(line string) { log.Printf("devpod up: %s", line) })
+}
+
+func devPodDeleteFunc(ctx context.Context, workspaceID string) error {
+	return devpod.SubprocessRunner{}.Delete(ctx, workspaceID)
 }
 
 // lspInstallFunc/claudeInstallFunc build a fresh devpod.SSHExecutor per
