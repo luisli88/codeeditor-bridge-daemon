@@ -14,7 +14,17 @@ import "fmt"
 func DefaultLSPCommand(languageID string) (string, []string, error) {
 	switch languageID {
 	case "python":
-		return "pyright-langserver", []string{"--stdio"}, nil
+		// bootstrap.installCommand installs pyright via `pip install
+		// --user`, which puts pyright-langserver in $HOME/.local/bin —
+		// confirmed live against a real devcontainer that this directory
+		// is NOT on PATH for a non-interactive `devpod ssh --command`
+		// session (unlike npm -g/rustup/go install's targets, which are
+		// already there), so a bare `pyright-langserver` fails to launch
+		// even though the binary is genuinely installed. `devpod ssh
+		// --command` re-interprets its value through a shell inside the
+		// Workspace (devpodexec.ShellJoin's doc comment), so `sh -c` here
+		// gets real $HOME/$PATH expansion, not a literal string.
+		return "sh", []string{"-c", "PATH=\"$HOME/.local/bin:$PATH\" exec pyright-langserver --stdio"}, nil
 	case "javascript", "typescript":
 		return "vtsls", []string{"--stdio"}, nil
 	case "rust":
