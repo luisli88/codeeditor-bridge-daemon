@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -115,12 +116,25 @@ func (m *CredentialManager) GenerateSSHKey(
 	return cred, string(ssh.MarshalAuthorizedKey(sshPub)), nil
 }
 
+// normalizeSSHPrivateKeyPEM guarantees privateKeyPEM ends in exactly one
+// trailing newline. Go's own ssh.ParsePrivateKey (used for validation just
+// below) tolerates a PEM blob missing the newline after
+// "-----END ... KEY-----" just fine, but the real `ssh`/`git` binaries that
+// actually clone/push/pull (internal/gitmanager's Clone/Operations, run as
+// subprocesses) reject it with a cryptic "error in libcrypto" — a real
+// gotcha when the key arrives from a client text field that preserves
+// every newline *within* the pasted text but drops the trailing one.
+func normalizeSSHPrivateKeyPEM(privateKeyPEM string) string {
+	return strings.TrimRight(privateKeyPEM, "\r\n") + "\n"
+}
+
 // ImportSSHKey validates that privateKeyPEM parses as an SSH private key,
 // then stores it.
 func (m *CredentialManager) ImportSSHKey(
 	ctx context.Context,
 	ownerUserID, alias, domain, privateKeyPEM string,
 ) (Credential, error) {
+	privateKeyPEM = normalizeSSHPrivateKeyPEM(privateKeyPEM)
 	if _, err := ssh.ParsePrivateKey([]byte(privateKeyPEM)); err != nil {
 		return Credential{}, fmt.Errorf("gitmanager: invalid SSH private key: %w", err)
 	}
@@ -229,6 +243,9 @@ func Revoke(cred *Credential) {
 // Reauthenticate replaces the secret behind an existing credential without
 // changing its alias or ID (FR-020).
 func (m *CredentialManager) Reauthenticate(ctx context.Context, cred *Credential, newSecret string) error {
+	if cred.Kind == CredentialKindSSHKey {
+		newSecret = normalizeSSHPrivateKeyPEM(newSecret)
+	}
 	if err := m.secrets.Put(ctx, cred.SecretRef, newSecret); err != nil {
 		return fmt.Errorf("gitmanager: store secret: %w", err)
 	}

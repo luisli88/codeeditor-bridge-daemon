@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,6 +92,41 @@ func TestImportSSHKey_InvalidPEM_ReturnsError(t *testing.T) {
 	_, err := manager.ImportSSHKey(context.Background(), "user-1", "Bad Import", "github.com", "not a real key")
 
 	require.Error(t, err)
+}
+
+// testEd25519PrivateKeyPEM is a real, throwaway OpenSSH private key
+// (generated for this test suite only, never used against a real
+// provider) — needed because normalizeSSHPrivateKeyPEM must round-trip
+// through Go's own ssh.ParsePrivateKey validation, which a synthetic
+// string can't satisfy.
+const testEd25519PrivateKeyPEM = "-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+	"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n" +
+	"QyNTUxOQAAACCKVzMG5CmaNPeCa24QYuDxje7uz6YluuMZB51fiY/rjgAAAJCHFE3IhxRN\n" +
+	"yAAAAAtzc2gtZWQyNTUxOQAAACCKVzMG5CmaNPeCa24QYuDxje7uz6YluuMZB51fiY/rjg\n" +
+	"AAAEAUeY/BD1egs//JKJkDS8a1KEKfv8EhxahjOVOkrm6uBopXMwbkKZo094JrbhBi4PGN\n" +
+	"7u7PpiW64xkHnV+Jj+uOAAAADHRlc3QtZml4dHVyZQE=\n" +
+	"-----END OPENSSH PRIVATE KEY-----\n"
+
+// A client text field can preserve every newline *within* a pasted PEM
+// but drop the trailing one after "-----END ... KEY-----" (confirmed
+// live: SwiftUI's TextField(axis: .vertical) does exactly this) — Go's
+// own ssh.ParsePrivateKey tolerates that missing newline just fine, but
+// the real `ssh`/`git` binaries used to actually clone don't, and fail
+// with a cryptic "error in libcrypto". ImportSSHKey must normalize this
+// before storing, so every later consumer of the secret gets a
+// byte-correct key regardless of what the client sent.
+func TestImportSSHKey_MissingTrailingNewline_NormalizedBeforeStoring(t *testing.T) {
+	store := newFakeSecretStore()
+	manager := gitmanager.NewCredentialManager(store, &fakeValidator{shouldFail: false})
+	keyMissingTrailingNewline := strings.TrimRight(testEd25519PrivateKeyPEM, "\n")
+	require.NotEqual(t, testEd25519PrivateKeyPEM, keyMissingTrailingNewline, "fixture must actually be missing the trailing newline")
+
+	cred, err := manager.ImportSSHKey(context.Background(), "user-1", "My Key", "github.com", keyMissingTrailingNewline)
+
+	require.NoError(t, err)
+	stored, err := store.Get(context.Background(), cred.SecretRef)
+	require.NoError(t, err)
+	assert.Equal(t, testEd25519PrivateKeyPEM, stored)
 }
 
 // TestRevoke_ThenReauthenticate_RestoresVerifiedStatus — FR-020: marcar
