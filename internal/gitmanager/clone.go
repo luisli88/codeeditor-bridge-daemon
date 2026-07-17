@@ -8,7 +8,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
+
+// maxErrorLines bounds how many trailing stderr lines Clone keeps for its
+// error message. Git often spreads the actually useful diagnostic across
+// several lines (e.g. "Permission denied (publickey)." / "Could not read
+// from remote repository." / "Please make sure you have the correct access
+// rights" / "and the repository exists.") — keeping only the very last line
+// surfaces just the generic boilerplate tail and hides the real cause.
+const maxErrorLines = 6
 
 // CloneProgress mirrors the `git` channel's clone payload
 // (contracts/websocket-protocol.md → Canal `git`).
@@ -94,11 +103,14 @@ func (c *Cloner) Clone(
 	// \n between updates — split on \r too, or every intermediate
 	// percentage gets silently coalesced into one giant "line".
 	scanner.Split(scanLinesOrCarriageReturns)
-	var lastLine string
+	var lastLines []string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line != "" {
-			lastLine = line
+			lastLines = append(lastLines, line)
+			if len(lastLines) > maxErrorLines {
+				lastLines = lastLines[1:]
+			}
 		}
 		reportCloneProgressLine(line, reporter)
 	}
@@ -107,10 +119,11 @@ func (c *Cloner) Clone(
 		reporter.Report(CloneProgress{Phase: "clone", Event: "error"})
 		// err.Error() alone is just "exit status 128" — meaningless to a
 		// Desarrollador. git always prints the real reason ("repository
-		// not found", "could not read Username", ...) as its last stderr
-		// line before exiting, so surface that instead when there is one.
-		if lastLine != "" {
-			return fmt.Errorf("gitmanager: clone %s: %s", repositoryURL, lastLine)
+		// not found", "Permission denied (publickey)", ...) somewhere in
+		// its trailing stderr lines before exiting, so surface those
+		// instead when there are any.
+		if len(lastLines) > 0 {
+			return fmt.Errorf("gitmanager: clone %s: %s", repositoryURL, strings.Join(lastLines, " "))
 		}
 		return fmt.Errorf("gitmanager: clone %s: %w", repositoryURL, err)
 	}

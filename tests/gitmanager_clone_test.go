@@ -73,6 +73,36 @@ func TestCloner_Clone_InvalidSource_ReportsErrorEvent(t *testing.T) {
 	require.True(t, sawError, "expected a clone/error progress event")
 }
 
+// Reproduces GitHub's real SSH permission-denied output, which spreads the
+// actually useful diagnostic across several stderr lines with generic
+// boilerplate ("and the repository exists.") as the very last one — a fake
+// `git` on PATH stands in for the real subprocess so the test doesn't
+// depend on network access or a real SSH key.
+func TestCloner_Clone_PermissionDenied_SurfacesRealDiagnosticNotJustLastLine(t *testing.T) {
+	fakeGitDir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo 'git@github.com: Permission denied (publickey).' >&2\n" +
+		"echo 'fatal: Could not read from remote repository.' >&2\n" +
+		"echo >&2\n" +
+		"echo 'Please make sure you have the correct access rights' >&2\n" +
+		"echo 'and the repository exists.' >&2\n" +
+		"exit 128\n"
+	writeFile(t, fakeGitDir, "git", script)
+	require.NoError(t, os.Chmod(filepath.Join(fakeGitDir, "git"), 0o755))
+	t.Setenv("PATH", fakeGitDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	baseDir := t.TempDir()
+	cloner := gitmanager.NewCloner(baseDir)
+	reporter := &recordingReporter{}
+
+	err := cloner.Clone(context.Background(), "ws-1", "git@github.com:luisli88/iegsb-portfolio.git", nil, reporter)
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "exit status 128")
+	require.Contains(t, err.Error(), "Permission denied (publickey)")
+	require.Contains(t, err.Error(), "Could not read from remote repository")
+}
+
 func TestCloner_WorkspacePath_IsRootedAtBaseDir(t *testing.T) {
 	cloner := gitmanager.NewCloner("/efs")
 	require.Equal(t, "/efs/ws-1", cloner.WorkspacePath("ws-1"))
