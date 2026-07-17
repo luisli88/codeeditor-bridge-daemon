@@ -39,8 +39,21 @@ func NewOperations(workspacePath func(workspaceID string) string) *Operations {
 }
 
 func (o *Operations) run(ctx context.Context, workspaceID string, env []string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = o.workspacePath(workspaceID)
+	workspacePath := o.workspacePath(workspaceID)
+	// `devpod up` (the step right after Clone) chowns the same host-side
+	// clone directory to the devcontainer's internal user so that
+	// container can write to it — confirmed live: every Workspace that
+	// finished provisioning ends up owned by a different UID than the
+	// Bridge Daemon's own process. Git 2.35.2+ refuses to operate on a
+	// repository owned by another user ("detected dubious ownership")
+	// unless the directory is explicitly allowlisted — without this,
+	// every git-channel operation (status/diff/branch/stage/commit/push/
+	// pull) failed for any Project past that point, which is why the app
+	// never showed a branch name at all rather than showing the wrong
+	// one. `-c safe.directory=` scopes the exception to this one
+	// invocation instead of mutating git's global config.
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "safe.directory=" + workspacePath}, args...)...)
+	cmd.Dir = workspacePath
 	if env != nil {
 		cmd.Env = append(os.Environ(), env...)
 	}

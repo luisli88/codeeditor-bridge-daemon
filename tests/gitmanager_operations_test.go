@@ -127,6 +127,29 @@ func TestDiff_StagedAndScopedToPath(t *testing.T) {
 	require.NotContains(t, scoped, "a.txt")
 }
 
+// `devpod up` chowns the host-side clone to the devcontainer's internal
+// user, so every git-channel operation past that point runs against a
+// directory git 2.35.2+ would otherwise refuse to touch ("detected
+// dubious ownership") — a real chown in this test would need root, so
+// this stands in a fake `git` on PATH and asserts the actual argv instead
+// of reproducing the ownership mismatch itself.
+func TestOperations_EveryGitInvocation_ScopesSafeDirectoryToTheWorkspacePath(t *testing.T) {
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	fakeGitDir := t.TempDir()
+	script := "#!/bin/sh\necho \"$@\" >> " + callsPath + "\necho ''\n"
+	writeFile(t, fakeGitDir, "git", script)
+	require.NoError(t, os.Chmod(filepath.Join(fakeGitDir, "git"), 0o755))
+	t.Setenv("PATH", fakeGitDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workspaceDir := t.TempDir()
+	ops := gitmanager.NewOperations(func(workspaceID string) string { return workspaceDir })
+	_, _ = ops.Branches(context.Background(), "ws-1")
+
+	calls, err := os.ReadFile(callsPath)
+	require.NoError(t, err)
+	require.Contains(t, string(calls), "-c safe.directory="+workspaceDir)
+}
+
 func TestBranches_ListsAndMarksCurrent(t *testing.T) {
 	ops, dir := newTestRepo(t)
 	writeFile(t, dir, "file.txt", "v1\n")
