@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -33,15 +34,51 @@ type lspServer struct {
 	stdout *bufio.Reader
 	mu     sync.Mutex // guards concurrent writes to stdin
 
+	// Guards handshakeReplayID/handshakeReplayDone below — unlike before,
+	// these are now genuinely accessed from two goroutines concurrently
+	// (`replayHandshake`, called from `Handler`'s goroutine, and `pump`'s
+	// own goroutine), since `replayHandshake` has to *wait* for `pump` to
+	// observe the reply instead of the two being safely sequenced by a
+	// single happens-before edge the way they used to be.
+	handshakeMu sync.Mutex
 	// handshakeReplayID, if set, is the JSON-RPC id of an `initialize`
 	// request `replayHandshake` wrote to this server on the client's
 	// behalf (see that function's doc comment) — `pump` swallows the one
 	// response carrying this id instead of relaying it to the client,
 	// which already got its own (synthetic) `initialize` response
 	// earlier and would treat a second one for the same id as a stray.
-	// Only `pump` (a single goroutine per server) reads or clears this,
-	// so it needs no lock of its own.
 	handshakeReplayID string
+	// handshakeReplayDone is closed by `pump` the moment it sees the
+	// response matching handshakeReplayID — `replayHandshake` blocks on
+	// it before sending the replayed `initialized`, since a real LSP
+	// client always waits for `initialize`'s response before proceeding
+	// and skipping that wait is what caused the bug this exists to fix
+	// (see `replayHandshake`'s doc comment).
+	handshakeReplayDone chan struct{}
+}
+
+// setHandshakeReplay records id as the JSON-RPC id `pump` should watch
+// for and treat as this server's own (not the client's) handshake reply.
+func (s *lspServer) setHandshakeReplay(id string, done chan struct{}) {
+	s.handshakeMu.Lock()
+	s.handshakeReplayID = id
+	s.handshakeReplayDone = done
+	s.handshakeMu.Unlock()
+}
+
+// matchHandshakeReplay reports whether id is the one `replayHandshake` is
+// waiting on — if so, clears it (so it's only ever matched once) and
+// returns the channel to close.
+func (s *lspServer) matchHandshakeReplay(id string) (chan struct{}, bool) {
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+	if s.handshakeReplayID == "" || s.handshakeReplayID != id {
+		return nil, false
+	}
+	done := s.handshakeReplayDone
+	s.handshakeReplayID = ""
+	s.handshakeReplayDone = nil
+	return done, true
 }
 
 // startLSPServer runs name+args inside workspaceID's devpod Workspace
@@ -254,14 +291,14 @@ func (p *LSPProxy) Handler() Handler {
 			return
 		}
 		if isNew {
-			// Replay before `pump` starts reading — not just ordering
-			// for its own sake: `pump` reads `server.handshakeReplayID`
-			// without its own lock, so everything this call sets must
-			// happen-before the `go` statement below, which Go's memory
-			// model guarantees for anything sequenced before a `go`
-			// (unlike two goroutines racing on the same field).
-			p.replayHandshake(workspaceID, server)
+			// `pump` now starts *before* the replay, not after — the
+			// replay has to actually wait for the subprocess's own
+			// response to the replayed `initialize` (see
+			// `replayHandshake`'s doc comment for why), which needs
+			// something already reading stdout to ever observe that
+			// response and signal it.
 			go p.pump(workspaceID, languageID, server)
+			p.replayHandshake(workspaceID, server)
 		}
 
 		if err := server.write(env.Payload); err != nil {
@@ -280,6 +317,20 @@ func (p *LSPProxy) Handler() Handler {
 // No-ops if this Workspace's client never sent `initialize` (e.g. a
 // synthetic/manual test) — server behaves exactly as it did before this
 // replay mechanism existed.
+//
+// Blocks until `pump` confirms the subprocess actually answered the
+// replayed `initialize` (or 30s elapses) before sending `initialized` —
+// this used to fire both writes back-to-back with no wait in between,
+// which a real LSP client never does (it always waits for `initialize`'s
+// response first). That race stayed invisible against a fast, trivial
+// project, but confirmed live against a real one (a Next.js + Amplify
+// project with a real tsconfig.json and a large node_modules): `vtsls`
+// stopped registering its ordinary request handlers when `initialized`/
+// the caller's real `didOpen` arrived while it was still synchronously
+// processing `initialize`, so every later `textDocument/completion` in
+// that same session came back `-32601 Unhandled method` instead of ever
+// answering — exactly the "no aparece nada" symptom, on a real project,
+// that a self-contained one-file test could never reproduce.
 func (p *LSPProxy) replayHandshake(workspaceID string, server *lspServer) {
 	p.mu.Lock()
 	hs, ok := p.handshake[workspaceID]
@@ -293,9 +344,14 @@ func (p *LSPProxy) replayHandshake(workspaceID string, server *lspServer) {
 	if err != nil {
 		return
 	}
-	server.handshakeReplayID = replayID
+	done := make(chan struct{})
+	server.setHandshakeReplay(replayID, done)
 	if err := server.write(payload); err != nil {
 		return
+	}
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
 	}
 	if hs.initializedPayload != nil {
 		_ = server.write(hs.initializedPayload)
@@ -382,9 +438,13 @@ func (p *LSPProxy) pump(workspaceID, languageID string, server *lspServer) {
 		if err != nil {
 			return
 		}
-		if id, ok := messageID(payload); ok && server.handshakeReplayID != "" && id == server.handshakeReplayID {
-			server.handshakeReplayID = "" // only the one, replayed initialize response
-			continue
+		if id, ok := messageID(payload); ok {
+			if done, matched := server.matchHandshakeReplay(id); matched {
+				if done != nil {
+					close(done) // wakes replayHandshake's select, waiting to send `initialized`
+				}
+				continue
+			}
 		}
 		p.mu.Lock()
 		active, ok := p.active[workspaceID]
